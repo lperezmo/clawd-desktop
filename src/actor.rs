@@ -57,6 +57,10 @@ pub fn sleepy_weights() -> Vec<f32> {
 }
 
 pub const SLEEP_AFTER_SECS: f32 = 120.0;
+/// Seconds of walking between acts.
+pub const ACT_GAP: (f32, f32) = (8.0, 20.0);
+/// How often a timer act runs straight into a second one.
+pub const CHAIN_CHANCE: f32 = 0.25;
 const RIDES: [&str; 4] = ["skate", "car", "scooter", "bike"];
 const RIDE_CHANCE: f32 = 0.2;
 const DT: f32 = 1.0 / FPS as f32;
@@ -70,13 +74,29 @@ pub struct World<'a> {
     pub idle_secs: f32,
 }
 
+/// Why an act is playing, which decides what follows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActKind {
+    /// The walk timer ran out; one in four chains into a second act.
+    Timer,
+    /// The second act of a chain; nothing follows it.
+    Chain,
+    /// The user is away: loops until input comes back.
+    Sleepy,
+}
+
+/// Whether an act of `kind` that just ended is followed straight away by another.
+pub fn chains(kind: ActKind, rng: &mut Rng) -> bool {
+    kind == ActKind::Timer && rng.f32() < CHAIN_CHANCE
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Walk,
     Act {
         act: usize,
         frame: usize,
-        sleepy: bool,
+        kind: ActKind,
     },
     Ride {
         sheet: usize,
@@ -134,7 +154,7 @@ impl Actor {
             owner: GROUND,
             mode: Mode::Fall { vy: 0.0, frame: 0 },
             walk_frame: 0,
-            next_act_in: rng.range(20.0, 60.0),
+            next_act_in: rng.range(ACT_GAP.0, ACT_GAP.1),
             walk: sheet_index("walk"),
             turning: act_index("turning"),
             weights: act_weights(),
@@ -191,7 +211,7 @@ impl Actor {
     fn start_walk(&mut self, rng: &mut Rng) {
         self.mode = Mode::Walk;
         self.walk_frame = 0;
-        self.next_act_in = rng.range(20.0, 60.0);
+        self.next_act_in = rng.range(ACT_GAP.0, ACT_GAP.1);
     }
 
     fn start_fall(&mut self) {
@@ -224,17 +244,25 @@ impl Actor {
 
         match self.mode {
             Mode::Walk => self.walk_step(world, s, rng),
-            Mode::Act { act, frame, sleepy } => {
-                let sleepy = sleepy && world.idle_secs >= 1.0;
+            Mode::Act { act, frame, kind } => {
+                // Back from away: finish this one and walk on.
+                let kind = if kind == ActKind::Sleepy && world.idle_secs < 1.0 {
+                    ActKind::Chain
+                } else {
+                    kind
+                };
                 let next = frame + 1;
                 if next < ACTS[act].frames.len() {
+                    self.mode = Mode::Act { act, frame: next, kind };
+                } else if kind == ActKind::Sleepy {
+                    self.mode = Mode::Act { act, frame: 0, kind };
+                } else if chains(kind, rng) {
+                    let act = pick_weighted(&self.weights, rng);
                     self.mode = Mode::Act {
                         act,
-                        frame: next,
-                        sleepy,
+                        frame: 0,
+                        kind: ActKind::Chain,
                     };
-                } else if sleepy {
-                    self.mode = Mode::Act { act, frame: 0, sleepy };
                 } else {
                     self.start_walk(rng);
                 }
@@ -304,7 +332,7 @@ impl Actor {
             self.mode = Mode::Act {
                 act,
                 frame: 0,
-                sleepy: true,
+                kind: ActKind::Sleepy,
             };
             return;
         }
@@ -325,7 +353,7 @@ impl Actor {
                 self.mode = Mode::Act {
                     act,
                     frame: 0,
-                    sleepy: false,
+                    kind: ActKind::Timer,
                 };
             }
             return;
@@ -463,6 +491,67 @@ mod tests {
             let n = ACTS[pick_weighted(&w, &mut rng)].name;
             assert!(matches!(n, "snooze" | "meditating" | "headphones"), "{n}");
         }
+    }
+
+    #[test]
+    fn one_timer_act_in_four_chains_and_chains_stop_at_two() {
+        let mut rng = Rng::new(21);
+        let n = 100_000;
+        let chained = (0..n).filter(|_| chains(ActKind::Timer, &mut rng)).count();
+        let got = chained as f32 / n as f32;
+        assert!((got - CHAIN_CHANCE).abs() < 0.01, "{got}");
+        for _ in 0..1000 {
+            assert!(!chains(ActKind::Chain, &mut rng));
+            assert!(!chains(ActKind::Sleepy, &mut rng));
+        }
+    }
+
+    #[test]
+    fn acts_come_every_8_to_20_seconds_and_some_chain() {
+        let s = build(&[], &[mon()], 72);
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+        };
+        let mut gaps = Vec::new();
+        let mut chained = 0;
+        let mut acts = 0;
+        for seed in 0..40 {
+            let mut rng = Rng::new(seed);
+            let mut a = Actor::new(900, 1032, 4, &mut rng);
+            let mut walked = 0;
+            let mut prev: Option<Mode> = None;
+            for _ in 0..12 * 120 {
+                a.step(&world, &mut rng);
+                match (prev, a.mode) {
+                    (_, Mode::Walk) => walked += 1,
+                    (Some(Mode::Walk), Mode::Act { kind, .. }) => {
+                        assert_eq!(kind, ActKind::Timer);
+                        gaps.push(walked as f32 / 12.0);
+                        walked = 0;
+                        acts += 1;
+                    }
+                    (
+                        Some(Mode::Act { kind: k0, .. }),
+                        Mode::Act {
+                            kind: ActKind::Chain, ..
+                        },
+                    ) if k0 != ActKind::Chain => {
+                        assert_eq!(k0, ActKind::Timer);
+                        chained += 1;
+                    }
+                    (_, Mode::Act { .. }) => {}
+                    // A ride ends a walk without an act.
+                    _ => walked = 0,
+                }
+                prev = Some(a.mode);
+            }
+        }
+        // The first gap includes the landing hop and the walk's stand-up frames.
+        assert!(gaps.iter().all(|&g| (7.5..=21.0).contains(&g)), "{gaps:?}");
+        assert!(acts > 150, "{acts}");
+        let share = chained as f32 / acts as f32;
+        assert!((0.12..0.4).contains(&share), "{chained} chains in {acts} acts");
     }
 
     fn mon() -> MonitorInfo {
