@@ -38,22 +38,31 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetLastInputInfo, LASTINPUTINFO};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetLastInputInfo, LASTINPUTINFO, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
+    UnregisterHotKey,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
-    GetAncestor, GetSystemMetrics, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE,
-    PeekMessageW, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW, SM_CXDRAG, TranslateMessage,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION,
-    WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+    FindWindowW, GA_ROOT, GetAncestor, GetSystemMetrics, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+    OBJID_WINDOW, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW,
+    SM_CXDRAG, TranslateMessage, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 const STEP: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
 const POLL: Duration = Duration::from_millis(500);
 const MIN_REBUILD: Duration = Duration::from_millis(100);
 const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// Ctrl+Alt+C: Perform.
+const HOTKEY_ID: i32 = 1;
+const CONTROL_CLASS: PCWSTR = w!("ClawdDesktopControl");
+/// Posted to the running copy's control window by `--perform`.
+const PERFORM_MESSAGE: PCWSTR = w!("ClawdDesktopPerform");
 /// How often the clock and the battery are read for the leans.
 const SIGNALS_EVERY: Duration = Duration::from_secs(60);
 /// Rest between foreground-change reactions, over all Clawds.
@@ -70,6 +79,8 @@ enum Event {
     TrayMenu,
     DisplayChange,
     TaskbarCreated,
+    /// Every Clawd plays an act now: tray, hotkey or `--perform`.
+    Perform,
     /// A top-level window was created and then shown.
     NewWindow(isize),
     Foreground(isize),
@@ -80,6 +91,7 @@ thread_local! {
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
     static DIRTY: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+    static PERFORM_MSG: Cell<u32> = const { Cell::new(0) };
     static RECENT: RefCell<Vec<(isize, Seen, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -137,6 +149,14 @@ unsafe extern "system" fn control_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             push(Event::TaskbarCreated);
             LRESULT(0)
         }
+        m if m != 0 && m == PERFORM_MSG.get() => {
+            push(Event::Perform);
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 == HOTKEY_ID as usize => {
+            push(Event::Perform);
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(h, msg, wp, lp) },
     }
 }
@@ -189,6 +209,7 @@ enum Action {
 
 struct Args {
     action: Action,
+    perform: bool,
     scale: Option<i32>,
     console: bool,
     run_for: Option<Duration>,
@@ -197,6 +218,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut a = Args {
         action: Action::Run,
+        perform: false,
         scale: None,
         console: false,
         run_for: None,
@@ -206,6 +228,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--scale" => a.scale = it.next().and_then(|v| v.parse().ok()).map(|s: i32| s.clamp(1, 12)),
             "--console" => a.console = true,
+            "--perform" => a.perform = true,
             "--install" => a.action = Action::Install,
             "--uninstall" => a.action = Action::Uninstall,
             "--run-for" => {
@@ -738,6 +761,7 @@ impl App {
                 self.set_count(n);
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
+            Command::Perform => self.perform(),
             Command::ToggleFollow => {
                 self.cfg.follow_claude = !self.cfg.follow_claude;
                 self.set_follow(self.cfg.follow_claude);
@@ -796,7 +820,11 @@ fn main() {
     }
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\clawd-desktop")) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        info!("already running; exiting");
+        if args.perform {
+            signal_perform();
+        } else {
+            info!("already running; exiting");
+        }
         return;
     }
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
@@ -816,6 +844,31 @@ fn main() {
     std::process::exit(code);
 }
 
+/// `--perform` with a copy already running: tells it through its control
+/// window, the same one the single-instance check protects.
+fn signal_perform() {
+    unsafe {
+        let msg = RegisterWindowMessageW(PERFORM_MESSAGE);
+        match FindWindowW(CONTROL_CLASS, PCWSTR::null()) {
+            Ok(h) if msg != 0 => match PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)) {
+                Ok(()) => info!("asked the running copy to perform"),
+                Err(e) => warn!("--perform: {e}"),
+            },
+            _ => warn!("--perform: the running copy has no control window"),
+        }
+    }
+}
+
+impl App {
+    /// Every Clawd plays an act now, with the leans.
+    fn perform(&mut self) {
+        info!("perform");
+        for i in 0..self.crowd.len() {
+            self.play_for_user(i, &[], false);
+        }
+    }
+}
+
 fn run(args: &Args) -> i32 {
     overlay::register_class();
     let hinst = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default() };
@@ -823,14 +876,15 @@ fn run(args: &Args) -> i32 {
         let wc = WNDCLASSW {
             lpfnWndProc: Some(control_proc),
             hInstance: hinst.into(),
-            lpszClassName: w!("ClawdDesktopControl"),
+            lpszClassName: CONTROL_CLASS,
             ..Default::default()
         };
         RegisterClassW(&wc);
         TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
+        PERFORM_MSG.set(RegisterWindowMessageW(PERFORM_MESSAGE));
         match CreateWindowExW(
             WS_EX_TOOLWINDOW,
-            w!("ClawdDesktopControl"),
+            CONTROL_CLASS,
             w!("Clawd Desktop"),
             WS_OVERLAPPED,
             0,
@@ -875,6 +929,11 @@ fn run(args: &Args) -> i32 {
     info!("{} window event hooks", hooks.len());
 
     let tray = Tray::new(control);
+    let hotkey = unsafe { RegisterHotKey(Some(control), HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x43) };
+    match &hotkey {
+        Ok(()) => info!("Ctrl+Alt+C performs"),
+        Err(e) => warn!("Ctrl+Alt+C is taken ({e}); Perform is still in the tray menu"),
+    }
 
     let mut cfg = Config::load();
     let scale = args.scale.unwrap_or(cfg.scale);
@@ -922,6 +981,9 @@ fn run(args: &Args) -> i32 {
     app.refresh_leans(true);
     let follow = app.cfg.follow_claude;
     app.set_follow(follow);
+    if args.perform {
+        push(Event::Perform);
+    }
 
     let started = Instant::now();
     let deadline = args.run_for.map(|d| started + d);
@@ -974,6 +1036,8 @@ fn run(args: &Args) -> i32 {
             match e {
                 Event::Quit => running = false,
                 Event::TaskbarCreated => tray.add(),
+                Event::Perform if !app.hidden && !app.cfg.paused => app.perform(),
+                Event::Perform => {}
                 Event::DisplayChange => {
                     info!("display change");
                     app.rebuild_overlays();
@@ -1092,6 +1156,11 @@ fn run(args: &Args) -> i32 {
     for h in hooks {
         unsafe {
             let _ = UnhookWinEvent(h);
+        }
+    }
+    if hotkey.is_ok() {
+        unsafe {
+            let _ = UnregisterHotKey(Some(control), HOTKEY_ID);
         }
     }
     drop(tray);
