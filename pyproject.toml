@@ -1,0 +1,20 @@
+# This file exists only to configure python-semantic-release, which bumps the
+# version in Cargo.toml and tags releases from Conventional Commits. The
+# project itself is a Rust binary crate, not a Python package.
+
+[tool.semantic_release]
+version_toml = ["Cargo.toml:package.version"]
+tag_format = "v{version}"
+commit_message = "chore(release): v{version}"
+# The release action runs in a container without cargo, so the crate's own
+# entry in Cargo.lock is bumped with sed instead of `cargo update`.
+build_command = """sed -i '/^name = "clawd-desktop"$/{n;s/^version = ".*"$/version = "'"$NEW_VERSION"'"/}' Cargo.lock"""
+assets = ["Cargo.lock"]
+# The Windows exe is built by the build-exe job in release.yml.
+
+[tool.semantic_release.commit_parser_options]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
+
+[tool.semantic_release.branches.main]
+match = "main"
