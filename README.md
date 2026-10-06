@@ -1,6 +1,6 @@
 # Clawd Desktop
 
-Clawd, the pixel lobster from claude.dev, walks along the top edges of your windows and the taskbar on Windows. He lives in transparent, click-through, topmost overlay windows, so he never takes focus or input and does not show up in Alt-Tab. Up to five of him can walk at once.
+Clawd, the pixel lobster from claude.dev, walks along the top edges of your windows and the taskbar on Windows. He lives in transparent, topmost overlay windows that never take focus and do not show up in Alt-Tab; only his own pixels take the mouse, and only while Clickable is on. Up to five of him can walk at once.
 
 <p align="center"><img src="assets/clawd-256.png" width="128" alt="Clawd"></p>
 
@@ -8,11 +8,23 @@ Clawd, the pixel lobster from claude.dev, walks along the top edges of your wind
 
 - **Surfaces**: he walks on the visible top edge of every window and on the taskbar, turns at the ends, and rides along when you drag the window he is standing on.
 - **Falling**: when that window closes, minimizes or moves out from under him, he falls to the next edge below.
-- **Acts**: every 20 to 60 seconds he stops for one of claude.dev's acts, or rides a skateboard, car, scooter or bike along the taskbar.
-- **Naps**: after two minutes without input he picks a rest act and keeps at it until you are back.
 - **Company**: with more than one Clawd, each keeps his own pace and timers; two walking into each other turn apart instead of passing through.
 
 He hides while a fullscreen app is in front.
+
+## What makes him do things
+
+- **Time**: every 8 to 20 seconds of walking he stops for one of claude.dev's acts (one time in four, two in a row), or rides along the taskbar.
+- **Away**: after two minutes without input he picks a rest act and keeps at it until you are back.
+- **New windows**: a terminal makes the nearest Clawd have a coffee or open his laptop, a browser gives him a lightbulb, an Explorer window his notebook.
+- **Focus**: switching windows makes one Clawd turn or look around.
+- **Windows going away**: closing or minimizing the window he stands on drops him to the next edge below.
+- **Leans** (tilt the usual pick, never force it): media playing leans toward headphones and dancing, under 20 percent battery toward a snooze, 7 to 10 am toward coffee, 1 to 4 pm toward sunglasses, 11 pm to 6 am toward a snooze.
+- **Claude Code** (with [clawd-buddy](https://github.com/lperezmo/clawd-buddy) 1.12 or later): while a session is locked in he leans toward the laptop, desktop, notebook, phone, thinking and coffee; while chill, toward the idle acts; when one celebrates, every Clawd celebrates at once and hops.
+- **You**: click him for an act, double click to celebrate, drag to pick him up (he drops onto the nearest edge below when you let go), right click for the tray menu.
+- **Perform**: the tray item, Ctrl+Alt+C or `--perform` makes every Clawd play an act now.
+
+Reactions are over in about three seconds (a laptop or desktop session in under ten) and never interrupt a fall or a drag.
 
 ## Install
 
@@ -26,9 +38,12 @@ That copies it to `%LOCALAPPDATA%\Programs\clawd-desktop\clawd-desktop.exe` and 
 
 ## Tray menu
 
+- Perform (Ctrl+Alt+C)
 - Pause / Resume
 - Clawds: 1 to 5
 - Scale: 2x, 3x, 4x, 6x
+- Clickable (on by default): off, the mouse goes straight through him as before.
+- Follow Claude Code (on by default): reads `%LOCALAPPDATA%\clawd\sessions`, which clawd-buddy writes; nothing happens if it does not exist.
 - Hide while fullscreen (on by default)
 - Start with Windows
 - Quit
@@ -42,6 +57,7 @@ Settings are saved in `%APPDATA%\clawd-desktop\config.toml`.
 - `--scale N`: screen pixels per sprite pixel (default 4, or the saved setting). Not saved.
 - `--console`: log to the parent console (or a new one) and to `%APPDATA%\clawd-desktop\clawd-desktop.log`.
 - `--run-for SECS`: quit cleanly after that many seconds.
+- `--perform`: tell the running copy to Perform, for a shortcut or another program; with none running, start and Perform.
 
 Only one copy runs at a time.
 
@@ -66,6 +82,8 @@ cargo run --example make-icon
 - One small layered window per Clawd per monitor, sized to his current frame and moved with each update.
 - Surfaces come from `DWMWA_EXTENDED_FRAME_BOUNDS`, so edges match what you see, not the invisible resize borders.
 - Frames are pushed with `UpdateLayeredWindow` at 12 fps, and only when the frame or position changed.
+- With Clickable on, each overlay drops `WS_EX_TRANSPARENT` and its window region is set to the opaque pixels of the frame it shows, so the rest of the window passes the mouse through.
+- Window events (create, show, uncloak, foreground) drive the reactions; the Claude Code folder is watched with a change notification. Media is checked every 5 seconds, the clock and battery once a minute.
 - `GetLastInputInfo` tells him when you have been away for two minutes.
 - Settings live in `%APPDATA%\clawd-desktop\config.toml`.
 
