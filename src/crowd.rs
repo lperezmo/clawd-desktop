@@ -160,6 +160,7 @@ mod tests {
         World {
             surfaces: s,
             idle_secs: 0.0,
+            leans: &[],
         }
     }
 

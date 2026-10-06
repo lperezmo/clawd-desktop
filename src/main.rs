@@ -5,20 +5,25 @@
 mod actor;
 mod config;
 mod crowd;
+mod hit;
 mod install;
+mod leans;
+mod mood;
 mod overlay;
+mod react;
+mod signals;
 mod sprites;
 #[rustfmt::skip]
 mod sprites_data;
 mod surfaces;
 mod tray;
 
-use actor::{Pose, Rng, World};
+use actor::{Pose, Rng, Trigger, World};
 use config::Config;
 use crowd::Crowd;
 use log::{debug, info, warn};
-use overlay::Overlay;
-use sprites::{FPS, frame, max_size, sheet_index};
+use overlay::{Mouse, Overlay};
+use sprites::{ACTS, FPS, act_index, frame, max_size, sheet_index};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -33,27 +38,52 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_DESTROY,
-    EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT, GetAncestor, MSG, MWMO_INPUTAVAILABLE,
-    MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
-    RegisterWindowMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetLastInputInfo, LASTINPUTINFO, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
+    UnregisterHotKey,
 };
-use windows::core::w;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+    FindWindowW, GA_ROOT, GetAncestor, GetSystemMetrics, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
+    OBJID_WINDOW, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW,
+    SM_CXDRAG, TranslateMessage, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
+};
+use windows::core::{PCWSTR, w};
 
 const STEP: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
 const POLL: Duration = Duration::from_millis(500);
 const MIN_REBUILD: Duration = Duration::from_millis(100);
 const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// Ctrl+Alt+C: Perform.
+const HOTKEY_ID: i32 = 1;
+const CONTROL_CLASS: PCWSTR = w!("ClawdDesktopControl");
+/// Posted to the running copy's control window by `--perform`.
+const PERFORM_MESSAGE: PCWSTR = w!("ClawdDesktopPerform");
+/// How often the clock and the battery are read for the leans.
+const SIGNALS_EVERY: Duration = Duration::from_secs(60);
+/// Rest between foreground-change reactions, over all Clawds.
+const FOREGROUND_REST: Duration = Duration::from_secs(8);
+/// How long a create or show waits for its other half, and how many wait.
+const PAIR_MS: u32 = 5000;
+const MAX_RECENT: usize = 512;
+/// A foreground change reacts this much later, so the new window that
+/// caused it reacts first.
+const FOREGROUND_DELAY: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     TrayMenu,
     DisplayChange,
     TaskbarCreated,
+    /// Every Clawd plays an act now: tray, hotkey or `--perform`.
+    Perform,
+    /// A top-level window was created and then shown.
+    NewWindow(isize),
+    Foreground(isize),
     Quit,
 }
 
@@ -61,6 +91,37 @@ thread_local! {
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
     static DIRTY: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+    static PERFORM_MSG: Cell<u32> = const { Cell::new(0) };
+    static RECENT: RefCell<Vec<(isize, Seen, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Created,
+    Shown,
+}
+
+/// Notes that `h` was created or shown. True when the other half arrived
+/// within `PAIR_MS`: a new top-level window. The two can come in either
+/// order (Explorer's create event lands after its show).
+fn pair(h: isize, seen: Seen) -> bool {
+    let now = unsafe { GetTickCount() };
+    RECENT.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|&(_, _, t)| now.wrapping_sub(t) < PAIR_MS);
+        if let Some(i) = r.iter().position(|&(x, s, _)| x == h && s != seen) {
+            r.swap_remove(i);
+            return true;
+        }
+        if seen == Seen::Shown && r.iter().any(|&(x, s, _)| x == h && s == seen) {
+            return false;
+        }
+        if r.len() >= MAX_RECENT {
+            r.remove(0);
+        }
+        r.push((h, seen, now));
+        false
+    })
 }
 
 fn push(e: Event) {
@@ -88,6 +149,14 @@ unsafe extern "system" fn control_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             push(Event::TaskbarCreated);
             LRESULT(0)
         }
+        m if m != 0 && m == PERFORM_MSG.get() => {
+            push(Event::Perform);
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 == HOTKEY_ID as usize => {
+            push(Event::Perform);
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(h, msg, wp, lp) },
     }
 }
@@ -104,8 +173,29 @@ unsafe extern "system" fn win_event(
     if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 || hwnd.0.is_null() {
         return;
     }
-    if event == EVENT_OBJECT_LOCATIONCHANGE && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd {
-        return;
+    let top = || unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd;
+    match event {
+        EVENT_OBJECT_LOCATIONCHANGE if !top() => return,
+        EVENT_OBJECT_CREATE => {
+            if top() && pair(hwnd.0 as isize, Seen::Created) {
+                push(Event::NewWindow(hwnd.0 as isize));
+            }
+            return;
+        }
+        // Shown, or uncloaked: Explorer and other DWM-cloaked windows show
+        // up cloaked and appear when uncloaked.
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
+            let h = hwnd.0 as isize;
+            if surfaces::scan::cloaked(hwnd) {
+                DIRTY.set(true);
+                return;
+            }
+            if pair(h, Seen::Shown) {
+                push(Event::NewWindow(h));
+            }
+        }
+        EVENT_SYSTEM_FOREGROUND => push(Event::Foreground(hwnd.0 as isize)),
+        _ => {}
     }
     DIRTY.set(true);
 }
@@ -119,6 +209,7 @@ enum Action {
 
 struct Args {
     action: Action,
+    perform: bool,
     scale: Option<i32>,
     console: bool,
     run_for: Option<Duration>,
@@ -127,6 +218,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut a = Args {
         action: Action::Run,
+        perform: false,
         scale: None,
         console: false,
         run_for: None,
@@ -136,6 +228,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--scale" => a.scale = it.next().and_then(|v| v.parse().ok()).map(|s: i32| s.clamp(1, 12)),
             "--console" => a.console = true,
+            "--perform" => a.perform = true,
             "--install" => a.action = Action::Install,
             "--uninstall" => a.action = Action::Uninstall,
             "--run-for" => {
@@ -222,6 +315,21 @@ struct View {
     overlays: Vec<Overlay>,
     buf: Vec<u32>,
     buf_key: Option<u64>,
+    /// Where `buf` last went on screen: top-left, width and height.
+    origin: (i32, i32),
+    size: (i32, i32),
+}
+
+/// The left button went down on a Clawd and is not up yet.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    clawd: usize,
+    at: (i32, i32),
+    /// From the cursor to his centre line and feet.
+    offset: (i32, i32),
+    dragging: bool,
+    /// The second press of a double click: its release is not a click.
+    double: bool,
 }
 
 struct App {
@@ -234,6 +342,21 @@ struct App {
     seeds: Rng,
     fullscreen: bool,
     hidden: bool,
+    /// What the leans are worked out from, and the leans themselves.
+    context: leans::Context,
+    /// Claude Code's sessions, while Follow Claude Code is on, and the mood
+    /// they add up to.
+    watch: Option<mood::watch::Watch>,
+    mood: Option<mood::Mood>,
+    /// The newest celebration already played.
+    celebrated_at: u64,
+    leans: Vec<f32>,
+    last_foreground_react: Option<Instant>,
+    /// A foreground change waiting for `FOREGROUND_DELAY`.
+    pending_foreground: Option<Instant>,
+    press: Option<Press>,
+    /// A single click waiting out the double-click time: Clawd and when.
+    pending_click: Option<(usize, Instant)>,
     last_rebuild: Instant,
     frames_drawn: u64,
     steps: u64,
@@ -396,6 +519,8 @@ impl App {
         }
         let (sw, sh) = (f.w as i32 * s, f.h as i32 * s);
         let pos = (f.left(pose.x, s, pose.mirrored), pose.y - sh);
+        v.origin = pos;
+        v.size = (sw, sh);
         let mut drew = false;
         for o in &mut v.overlays {
             drew |= o.show(&v.buf, sw, sh, pos, key);
@@ -403,6 +528,212 @@ impl App {
         if drew {
             self.frames_drawn += 1;
         }
+    }
+
+    /// Re-reads the clock, battery and media state; recomputes the leans
+    /// when any changed. `full` also reads the clock and battery.
+    fn refresh_leans(&mut self, full: bool) {
+        let mut ctx = self.context;
+        if full {
+            ctx.hour = signals::local_hour();
+            ctx.low_battery = signals::low_battery();
+        }
+        ctx.media = signals::media_playing();
+        if ctx != self.context || self.leans.is_empty() {
+            self.context = ctx;
+            self.set_leans();
+        }
+    }
+
+    fn set_leans(&mut self) {
+        let names = mood::lean_names(self.mood);
+        self.leans = leans::combine(&leans::leans(&self.context), &leans::from_names(names));
+        info!(
+            "leaning toward {:?}, Claude Code {:?}",
+            leans::reasons(&self.context),
+            self.mood
+        );
+    }
+
+    fn set_follow(&mut self, on: bool) {
+        self.watch = on.then(mood::watch::Watch::new);
+        self.update_mood();
+    }
+
+    /// Works out Claude Code's mood again; a new celebration makes every
+    /// Clawd celebrate at once and hop.
+    fn update_mood(&mut self) {
+        let now = mood::now_ms();
+        let live = self
+            .watch
+            .as_ref()
+            .map(|w| mood::live(&w.sessions, now, mood::watch::alive))
+            .unwrap_or_default();
+        let m = mood::derive(&live, now);
+        if m != self.mood {
+            self.mood = m;
+            self.set_leans();
+        }
+        if let Some(at) = mood::newest_celebration(&live, now)
+            && at > self.celebrated_at
+        {
+            self.celebrated_at = at;
+            info!("Claude Code celebrates");
+            for i in 0..self.crowd.len() {
+                self.play_for_user(i, &react::CELEBRATION_ACTS, true);
+            }
+        }
+    }
+
+    /// A new top-level window: a terminal, browser or Explorer window makes
+    /// the nearest Clawd that is free react.
+    fn new_window(&mut self, h: isize) {
+        let Some((exe, class, rect)) = react::win::describe(HWND(h as *mut _)) else {
+            return;
+        };
+        let Some(kind) = react::classify(&exe, &class) else {
+            debug!("new window {class} of {exe}: no reaction");
+            return;
+        };
+        let at = ((rect.left + rect.right) / 2, rect.top);
+        let points: Vec<(i32, i32)> = self
+            .crowd
+            .members
+            .iter()
+            .map(|m| (m.actor.x as i32, m.actor.y as i32))
+            .collect();
+        for i in react::nearest_first(&points, at) {
+            let m = &mut self.crowd.members[i];
+            let acts = react::acts_for(kind);
+            let act = act_index(acts[(m.rng.next_u64() % acts.len() as u64) as usize]);
+            if m.actor.react(act, Trigger::Desktop, false) {
+                info!("new {kind:?} window ({class}): Clawd {i} plays {}", ACTS[act].name);
+                // The foreground change it caused is this reaction.
+                self.pending_foreground = None;
+                return;
+            }
+        }
+        debug!("new {kind:?} window: every Clawd is busy");
+    }
+
+    /// The foreground window changed: one free Clawd turns or looks around.
+    fn foreground(&mut self, now: Instant) {
+        if self.last_foreground_react.is_some_and(|t| now - t < FOREGROUND_REST) {
+            return;
+        }
+        let n = self.crowd.len();
+        if n == 0 {
+            return;
+        }
+        let start = (self.seeds.next_u64() % n as u64) as usize;
+        for k in 0..n {
+            let i = (start + k) % n;
+            let m = &mut self.crowd.members[i];
+            let name = react::FOREGROUND_ACTS[(m.rng.next_u64() % 2) as usize];
+            if m.actor.react(act_index(name), Trigger::Desktop, false) {
+                debug!("foreground change: Clawd {i} plays {name}");
+                self.last_foreground_react = Some(now);
+                return;
+            }
+        }
+    }
+
+    fn set_clickable(&mut self, on: bool) {
+        overlay::set_clickable_default(on);
+        for v in &mut self.views {
+            for o in &mut v.overlays {
+                o.set_clickable(on);
+            }
+        }
+        if !on {
+            self.drop_press();
+        }
+    }
+
+    /// Which Clawd an overlay window belongs to.
+    fn clawd_of(&self, id: isize) -> Option<usize> {
+        self.views.iter().position(|v| v.overlays.iter().any(|o| o.id() == id))
+    }
+
+    /// Lets go of whatever the mouse was holding.
+    fn drop_press(&mut self) {
+        if let Some(p) = self.press.take()
+            && p.dragging
+            && let Some(m) = self.crowd.members.get_mut(p.clawd)
+        {
+            m.actor.release();
+        }
+    }
+
+    /// One act for Clawd `i` because of the user: `names` to pick from, or
+    /// the usual weighted pick with the leans when empty.
+    fn play_for_user(&mut self, i: usize, names: &[&str], then_hop: bool) {
+        let Some(m) = self.crowd.members.get_mut(i) else { return };
+        let act = if names.is_empty() {
+            m.actor.pick(&self.leans, &mut m.rng)
+        } else {
+            act_index(names[(m.rng.next_u64() % names.len() as u64) as usize])
+        };
+        if m.actor.react(act, Trigger::User, then_hop) {
+            info!("Clawd {i} plays {}", ACTS[act].name);
+        }
+    }
+
+    /// Clicks, double clicks, drags and right clicks on a Clawd.
+    fn mouse(&mut self, m: Mouse, now: Instant) -> bool {
+        match m {
+            Mouse::Down(id, p) | Mouse::Double(id, p) => {
+                let Some(i) = self.clawd_of(id) else { return false };
+                let v = &self.views[i];
+                if !hit::opaque_at(&v.buf, v.origin, v.size.0, v.size.1, p) {
+                    debug!("press at {p:?} missed Clawd {i}'s pixels");
+                    return false;
+                }
+                let a = self.crowd.members[i].actor.pose();
+                let double = matches!(m, Mouse::Double(..));
+                self.press = Some(Press {
+                    clawd: i,
+                    at: p,
+                    offset: (a.x - p.0, a.y - p.1),
+                    dragging: false,
+                    double,
+                });
+                if double {
+                    self.pending_click = None;
+                    self.play_for_user(i, &react::CELEBRATION_ACTS, false);
+                }
+            }
+            Mouse::Move(_, p) => {
+                let Some(mut press) = self.press else { return false };
+                let slop = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(2);
+                if !press.dragging && ((p.0 - press.at.0).abs() > slop || (p.1 - press.at.1).abs() > slop) {
+                    press.dragging = true;
+                    self.pending_click = None;
+                    self.crowd.members[press.clawd].actor.grab();
+                    info!("Clawd {} picked up", press.clawd);
+                }
+                if press.dragging {
+                    let a = &mut self.crowd.members[press.clawd].actor;
+                    a.drag_to(p.0 + press.offset.0, p.1 + press.offset.1);
+                    let pose = a.pose();
+                    self.render(press.clawd, pose);
+                }
+                self.press = Some(press);
+            }
+            Mouse::Up(..) => {
+                let Some(press) = self.press.take() else { return false };
+                if press.dragging {
+                    self.crowd.members[press.clawd].actor.release();
+                    info!("Clawd {} let go", press.clawd);
+                } else if !press.double {
+                    let wait = Duration::from_millis(unsafe { GetDoubleClickTime() } as u64);
+                    self.pending_click = Some((press.clawd, now + wait));
+                }
+            }
+            Mouse::Lost(_) => self.drop_press(),
+            Mouse::Right(..) => return true,
+        }
+        false
     }
 
     fn set_scale(&mut self, s: i32) {
@@ -430,6 +761,15 @@ impl App {
                 self.set_count(n);
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
+            Command::Perform => self.perform(),
+            Command::ToggleFollow => {
+                self.cfg.follow_claude = !self.cfg.follow_claude;
+                self.set_follow(self.cfg.follow_claude);
+            }
+            Command::ToggleClickable => {
+                self.cfg.clickable = !self.cfg.clickable;
+                self.set_clickable(self.cfg.clickable);
+            }
             Command::ToggleStartup => {
                 if let Err(e) = install::set_startup(!install::startup_enabled()) {
                     warn!("start with Windows: {e}");
@@ -480,7 +820,11 @@ fn main() {
     }
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\clawd-desktop")) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        info!("already running; exiting");
+        if args.perform {
+            signal_perform();
+        } else {
+            info!("already running; exiting");
+        }
         return;
     }
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
@@ -500,6 +844,31 @@ fn main() {
     std::process::exit(code);
 }
 
+/// `--perform` with a copy already running: tells it through its control
+/// window, the same one the single-instance check protects.
+fn signal_perform() {
+    unsafe {
+        let msg = RegisterWindowMessageW(PERFORM_MESSAGE);
+        match FindWindowW(CONTROL_CLASS, PCWSTR::null()) {
+            Ok(h) if msg != 0 => match PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)) {
+                Ok(()) => info!("asked the running copy to perform"),
+                Err(e) => warn!("--perform: {e}"),
+            },
+            _ => warn!("--perform: the running copy has no control window"),
+        }
+    }
+}
+
+impl App {
+    /// Every Clawd plays an act now, with the leans.
+    fn perform(&mut self) {
+        info!("perform");
+        for i in 0..self.crowd.len() {
+            self.play_for_user(i, &[], false);
+        }
+    }
+}
+
 fn run(args: &Args) -> i32 {
     overlay::register_class();
     let hinst = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default() };
@@ -507,14 +876,15 @@ fn run(args: &Args) -> i32 {
         let wc = WNDCLASSW {
             lpfnWndProc: Some(control_proc),
             hInstance: hinst.into(),
-            lpszClassName: w!("ClawdDesktopControl"),
+            lpszClassName: CONTROL_CLASS,
             ..Default::default()
         };
         RegisterClassW(&wc);
         TASKBAR_CREATED.set(RegisterWindowMessageW(w!("TaskbarCreated")));
+        PERFORM_MSG.set(RegisterWindowMessageW(PERFORM_MESSAGE));
         match CreateWindowExW(
             WS_EX_TOOLWINDOW,
-            w!("ClawdDesktopControl"),
+            CONTROL_CLASS,
             w!("Clawd Desktop"),
             WS_OVERLAPPED,
             0,
@@ -538,7 +908,8 @@ fn run(args: &Args) -> i32 {
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
-        (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
     ]
     .iter()
@@ -558,6 +929,11 @@ fn run(args: &Args) -> i32 {
     info!("{} window event hooks", hooks.len());
 
     let tray = Tray::new(control);
+    let hotkey = unsafe { RegisterHotKey(Some(control), HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x43) };
+    match &hotkey {
+        Ok(()) => info!("Ctrl+Alt+C performs"),
+        Err(e) => warn!("Ctrl+Alt+C is taken ({e}); Perform is still in the tray menu"),
+    }
 
     let mut cfg = Config::load();
     let scale = args.scale.unwrap_or(cfg.scale);
@@ -572,6 +948,7 @@ fn run(args: &Args) -> i32 {
     let walk_h = sprites::SHEETS[sheet_index("walk")].h as i32;
     debug_assert_eq!(walk_h, SHEETS_WALK_H);
     let count = cfg.count;
+    overlay::set_clickable_default(cfg.clickable);
 
     let mut app = App {
         cfg,
@@ -583,6 +960,15 @@ fn run(args: &Args) -> i32 {
         seeds: Rng::new(seed),
         fullscreen: false,
         hidden: false,
+        context: leans::Context::default(),
+        watch: None,
+        mood: None,
+        celebrated_at: 0,
+        leans: Vec::new(),
+        last_foreground_react: None,
+        pending_foreground: None,
+        press: None,
+        pending_click: None,
         last_rebuild: Instant::now(),
         frames_drawn: 0,
         steps: 0,
@@ -591,11 +977,19 @@ fn run(args: &Args) -> i32 {
     app.rebuild_overlays();
     app.rebuild_surfaces();
     app.set_count(count);
+    signals::start_media_watch();
+    app.refresh_leans(true);
+    let follow = app.cfg.follow_claude;
+    app.set_follow(follow);
+    if args.perform {
+        push(Event::Perform);
+    }
 
     let started = Instant::now();
     let deadline = args.run_for.map(|d| started + d);
     let mut next_step = Instant::now();
     let mut next_status = started + STATUS_EVERY;
+    let mut next_signals = started + SIGNALS_EVERY;
     let mut running = true;
 
     while running {
@@ -619,8 +1013,11 @@ fn run(args: &Args) -> i32 {
             wait.as_millis().min(u32::MAX as u128 - 1) as u32
         };
         if ms > 0 {
+            // The sessions folder's change handle wakes the loop too.
+            let handles: Vec<_> = app.watch.as_ref().and_then(|w| w.handle()).into_iter().collect();
+            let handles = (!handles.is_empty()).then_some(&handles[..]);
             unsafe {
-                MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                MsgWaitForMultipleObjectsEx(handles, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             }
         }
 
@@ -639,11 +1036,18 @@ fn run(args: &Args) -> i32 {
             match e {
                 Event::Quit => running = false,
                 Event::TaskbarCreated => tray.add(),
+                Event::Perform if !app.hidden && !app.cfg.paused => app.perform(),
+                Event::Perform => {}
                 Event::DisplayChange => {
                     info!("display change");
                     app.rebuild_overlays();
                     app.rebuild_surfaces();
                 }
+                Event::NewWindow(h) if !app.hidden && !app.cfg.paused => app.new_window(h),
+                Event::Foreground(_) if !app.hidden && !app.cfg.paused => {
+                    app.pending_foreground = Some(Instant::now() + FOREGROUND_DELAY)
+                }
+                Event::NewWindow(_) | Event::Foreground(_) => {}
                 Event::TrayMenu => {
                     if let Some(cmd) = tray.menu(&app.cfg) {
                         running &= app.handle(cmd);
@@ -653,6 +1057,26 @@ fn run(args: &Args) -> i32 {
         }
 
         let now = Instant::now();
+        if let Some(w) = app.watch.as_mut()
+            && w.poll(now)
+        {
+            app.update_mood();
+        }
+        let mut menu = false;
+        for m in overlay::take_mouse() {
+            if !app.hidden {
+                menu |= app.mouse(m, now);
+            }
+        }
+        if menu && let Some(cmd) = tray.menu(&app.cfg) {
+            running &= app.handle(cmd);
+        }
+        if let Some((i, at)) = app.pending_click
+            && now >= at
+        {
+            app.pending_click = None;
+            app.play_for_user(i, &[], false);
+        }
         if deadline.is_some_and(|d| now >= d) {
             info!("--run-for elapsed after {:.1} s", (now - started).as_secs_f32());
             running = false;
@@ -681,6 +1105,7 @@ fn run(args: &Args) -> i32 {
             let world = World {
                 surfaces: &app.surfaces,
                 idle_secs: idle_secs(),
+                leans: &app.leans,
             };
             app.crowd.step(&world);
             app.steps += 1;
@@ -692,6 +1117,18 @@ fn run(args: &Args) -> i32 {
             if next_step < now {
                 next_step = now + STEP;
             }
+        }
+
+        if app.pending_foreground.is_some_and(|t| now >= t) {
+            app.pending_foreground = None;
+            app.foreground(now);
+        }
+
+        if now >= next_signals {
+            next_signals = now + SIGNALS_EVERY;
+            app.refresh_leans(true);
+        } else if !hide && app.steps.is_multiple_of(FPS as u64) {
+            app.refresh_leans(false);
         }
 
         if now >= next_status {
@@ -719,6 +1156,11 @@ fn run(args: &Args) -> i32 {
     for h in hooks {
         unsafe {
             let _ = UnhookWinEvent(h);
+        }
+    }
+    if hotkey.is_ok() {
+        unsafe {
+            let _ = UnregisterHotKey(Some(control), HOTKEY_ID);
         }
     }
     drop(tray);
