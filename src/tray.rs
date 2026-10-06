@@ -28,6 +28,7 @@ pub enum Command {
     ToggleStartup,
     ToggleClickable,
     ToggleFollow,
+    ToggleAntics,
     Perform,
     Quit,
 }
@@ -39,6 +40,7 @@ const ID_QUIT: usize = 4;
 const ID_CLICKABLE: usize = 5;
 const ID_FOLLOW: usize = 6;
 const ID_PERFORM: usize = 7;
+const ID_ANTICS: usize = 8;
 const ID_SCALE: usize = 100;
 const ID_COUNT: usize = 200;
 
@@ -127,6 +129,7 @@ impl Tray {
                 ID_FOLLOW,
                 w!("Follow Claude Code"),
             );
+            let _ = AppendMenuW(m, MF_STRING | check(cfg.crowd_antics), ID_ANTICS, w!("Crowd antics"));
             let _ = AppendMenuW(
                 m,
                 MF_STRING | check(cfg.hide_fullscreen),
@@ -165,6 +168,7 @@ impl Tray {
                 ID_STARTUP => Some(Command::ToggleStartup),
                 ID_CLICKABLE => Some(Command::ToggleClickable),
                 ID_FOLLOW => Some(Command::ToggleFollow),
+                ID_ANTICS => Some(Command::ToggleAntics),
                 ID_PERFORM => Some(Command::Perform),
                 ID_QUIT => Some(Command::Quit),
                 n if n > ID_COUNT => Some(Command::Count(n - ID_COUNT)),

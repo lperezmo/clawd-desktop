@@ -513,12 +513,20 @@ impl App {
             };
             (id << 32) ^ ((pose.frame as u64) << 8) ^ ((pose.mirrored as u64) << 7) ^ (s as u64)
         };
+        let key = key ^ ((pose.mark as u64) << 6);
+        let left = f.left(pose.x, s, pose.mirrored);
+        let (sw, sh) = (
+            f.w as i32 * s,
+            (f.h + if pose.mark { sprites::MARK_ROWS } else { 0 }) as i32 * s,
+        );
         if v.buf_key != Some(key) {
             f.render(s as usize, pose.mirrored, &mut v.buf);
+            if pose.mark {
+                sprites::add_mark(&mut v.buf, sw as usize, s as usize, pose.x - left);
+            }
             v.buf_key = Some(key);
         }
-        let (sw, sh) = (f.w as i32 * s, f.h as i32 * s);
-        let pos = (f.left(pose.x, s, pose.mirrored), pose.y - sh);
+        let pos = (left, pose.y - sh);
         v.origin = pos;
         v.size = (sw, sh);
         let mut drew = false;
@@ -570,6 +578,7 @@ impl App {
             .map(|w| mood::live(&w.sessions, now, mood::watch::alive))
             .unwrap_or_default();
         let m = mood::derive(&live, now);
+        self.crowd.lockin = m == Some(mood::Mood::Lockin);
         if m != self.mood {
             self.mood = m;
             self.set_leans();
@@ -769,6 +778,10 @@ impl App {
             Command::ToggleClickable => {
                 self.cfg.clickable = !self.cfg.clickable;
                 self.set_clickable(self.cfg.clickable);
+            }
+            Command::ToggleAntics => {
+                self.cfg.crowd_antics = !self.cfg.crowd_antics;
+                self.crowd.antics = self.cfg.crowd_antics;
             }
             Command::ToggleStartup => {
                 if let Err(e) = install::set_startup(!install::startup_enabled()) {
@@ -974,6 +987,7 @@ fn run(args: &Args) -> i32 {
         steps: 0,
         rebuilds: 0,
     };
+    app.crowd.antics = app.cfg.crowd_antics;
     app.rebuild_overlays();
     app.rebuild_surfaces();
     app.set_count(count);
@@ -1107,7 +1121,9 @@ fn run(args: &Args) -> i32 {
                 idle_secs: idle_secs(),
                 leans: &app.leans,
             };
-            app.crowd.step(&world);
+            for e in app.crowd.step(&world) {
+                info!("{e}");
+            }
             app.steps += 1;
             for i in 0..app.crowd.len() {
                 let pose = app.crowd.members[i].actor.pose();
