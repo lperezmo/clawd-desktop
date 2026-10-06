@@ -8,6 +8,7 @@ mod crowd;
 mod hit;
 mod install;
 mod leans;
+mod mood;
 mod overlay;
 mod react;
 mod signals;
@@ -320,6 +321,12 @@ struct App {
     hidden: bool,
     /// What the leans are worked out from, and the leans themselves.
     context: leans::Context,
+    /// Claude Code's sessions, while Follow Claude Code is on, and the mood
+    /// they add up to.
+    watch: Option<mood::watch::Watch>,
+    mood: Option<mood::Mood>,
+    /// The newest celebration already played.
+    celebrated_at: u64,
     leans: Vec<f32>,
     last_foreground_react: Option<Instant>,
     /// A foreground change waiting for `FOREGROUND_DELAY`.
@@ -511,8 +518,47 @@ impl App {
         ctx.media = signals::media_playing();
         if ctx != self.context || self.leans.is_empty() {
             self.context = ctx;
-            self.leans = leans::leans(&ctx);
-            info!("leaning toward {:?}", leans::reasons(&ctx));
+            self.set_leans();
+        }
+    }
+
+    fn set_leans(&mut self) {
+        let names = mood::lean_names(self.mood);
+        self.leans = leans::combine(&leans::leans(&self.context), &leans::from_names(names));
+        info!(
+            "leaning toward {:?}, Claude Code {:?}",
+            leans::reasons(&self.context),
+            self.mood
+        );
+    }
+
+    fn set_follow(&mut self, on: bool) {
+        self.watch = on.then(mood::watch::Watch::new);
+        self.update_mood();
+    }
+
+    /// Works out Claude Code's mood again; a new celebration makes every
+    /// Clawd celebrate at once and hop.
+    fn update_mood(&mut self) {
+        let now = mood::now_ms();
+        let live = self
+            .watch
+            .as_ref()
+            .map(|w| mood::live(&w.sessions, now, mood::watch::alive))
+            .unwrap_or_default();
+        let m = mood::derive(&live, now);
+        if m != self.mood {
+            self.mood = m;
+            self.set_leans();
+        }
+        if let Some(at) = mood::newest_celebration(&live, now)
+            && at > self.celebrated_at
+        {
+            self.celebrated_at = at;
+            info!("Claude Code celebrates");
+            for i in 0..self.crowd.len() {
+                self.play_for_user(i, &react::CELEBRATION_ACTS, true);
+            }
         }
     }
 
@@ -692,6 +738,10 @@ impl App {
                 self.set_count(n);
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
+            Command::ToggleFollow => {
+                self.cfg.follow_claude = !self.cfg.follow_claude;
+                self.set_follow(self.cfg.follow_claude);
+            }
             Command::ToggleClickable => {
                 self.cfg.clickable = !self.cfg.clickable;
                 self.set_clickable(self.cfg.clickable);
@@ -852,6 +902,9 @@ fn run(args: &Args) -> i32 {
         fullscreen: false,
         hidden: false,
         context: leans::Context::default(),
+        watch: None,
+        mood: None,
+        celebrated_at: 0,
         leans: Vec::new(),
         last_foreground_react: None,
         pending_foreground: None,
@@ -867,6 +920,8 @@ fn run(args: &Args) -> i32 {
     app.set_count(count);
     signals::start_media_watch();
     app.refresh_leans(true);
+    let follow = app.cfg.follow_claude;
+    app.set_follow(follow);
 
     let started = Instant::now();
     let deadline = args.run_for.map(|d| started + d);
@@ -896,8 +951,11 @@ fn run(args: &Args) -> i32 {
             wait.as_millis().min(u32::MAX as u128 - 1) as u32
         };
         if ms > 0 {
+            // The sessions folder's change handle wakes the loop too.
+            let handles: Vec<_> = app.watch.as_ref().and_then(|w| w.handle()).into_iter().collect();
+            let handles = (!handles.is_empty()).then_some(&handles[..]);
             unsafe {
-                MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                MsgWaitForMultipleObjectsEx(handles, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             }
         }
 
@@ -935,6 +993,11 @@ fn run(args: &Args) -> i32 {
         }
 
         let now = Instant::now();
+        if let Some(w) = app.watch.as_mut()
+            && w.poll(now)
+        {
+            app.update_mood();
+        }
         let mut menu = false;
         for m in overlay::take_mouse() {
             if !app.hidden {

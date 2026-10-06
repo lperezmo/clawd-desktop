@@ -27,6 +27,7 @@ pub enum Command {
     ToggleFullscreen,
     ToggleStartup,
     ToggleClickable,
+    ToggleFollow,
     Quit,
 }
 
@@ -35,6 +36,7 @@ const ID_FULLSCREEN: usize = 2;
 const ID_STARTUP: usize = 3;
 const ID_QUIT: usize = 4;
 const ID_CLICKABLE: usize = 5;
+const ID_FOLLOW: usize = 6;
 const ID_SCALE: usize = 100;
 const ID_COUNT: usize = 200;
 
@@ -118,6 +120,12 @@ impl Tray {
             let _ = AppendMenuW(m, MF_STRING | check(cfg.clickable), ID_CLICKABLE, w!("Clickable"));
             let _ = AppendMenuW(
                 m,
+                MF_STRING | check(cfg.follow_claude),
+                ID_FOLLOW,
+                w!("Follow Claude Code"),
+            );
+            let _ = AppendMenuW(
+                m,
                 MF_STRING | check(cfg.hide_fullscreen),
                 ID_FULLSCREEN,
                 w!("Hide while fullscreen"),
@@ -153,6 +161,7 @@ impl Tray {
                 ID_FULLSCREEN => Some(Command::ToggleFullscreen),
                 ID_STARTUP => Some(Command::ToggleStartup),
                 ID_CLICKABLE => Some(Command::ToggleClickable),
+                ID_FOLLOW => Some(Command::ToggleFollow),
                 ID_QUIT => Some(Command::Quit),
                 n if n > ID_COUNT => Some(Command::Count(n - ID_COUNT)),
                 n if n > ID_SCALE => Some(Command::Scale((n - ID_SCALE) as i32)),

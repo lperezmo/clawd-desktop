@@ -48,7 +48,6 @@ pub fn from_names(names: &[&str]) -> Vec<f32> {
 }
 
 /// Entry-by-entry product of two lean lists.
-#[allow(dead_code)] // used once Claude Code moods land
 pub fn combine(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(x, y)| x * y).collect()
 }
