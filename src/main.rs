@@ -1149,6 +1149,9 @@ fn run(args: &Args) -> i32 {
             for e in app.crowd.step(&world) {
                 info!("{e}");
             }
+            for i in app.crowd.space_wishes() {
+                app.float(i);
+            }
             app.steps += 1;
             for i in 0..app.crowd.len() {
                 let pose = app.crowd.members[i].actor.pose();

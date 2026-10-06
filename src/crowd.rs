@@ -619,6 +619,14 @@ impl Crowd {
         p != Plan::Pass
     }
 
+    /// Who wants the space act now that an act came due; each wish is
+    /// cleared. The app grants them with `float`, which needs the work areas.
+    pub fn space_wishes(&mut self) -> Vec<usize> {
+        (0..self.members.len())
+            .filter(|&i| self.members[i].actor.take_space_wish())
+            .collect()
+    }
+
     /// Clawd `i` plays the space act with gravity off, inside his work area
     /// (one of `areas`). A rider on his head gets down first, he floats off
     /// the head he is riding on, and with antics on anyone standing within a

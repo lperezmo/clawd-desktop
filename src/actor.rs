@@ -63,6 +63,10 @@ pub const ACT_GAP: (f32, f32) = (8.0, 20.0);
 pub const CHAIN_CHANCE: f32 = 0.25;
 const RIDES: [&str; 4] = ["skate", "car", "scooter", "bike"];
 const RIDE_CHANCE: f32 = 0.2;
+/// When an act is due, how often he asks for the space act in zero g
+/// instead (the crowd grants it, since it needs the work area): about once
+/// every 20 to 30 minutes per Clawd.
+pub const SPACE_CHANCE: f32 = 0.01;
 const DT: f32 = 1.0 / FPS as f32;
 /// Half of Clawd's body width in sprite pixels: how close to an end he walks.
 pub const HALF_BODY: f32 = 8.0;
@@ -346,6 +350,9 @@ pub struct Actor {
     rest: f32,
     /// Seconds since he last set off walking.
     walking_for: f32,
+    /// An act was due and he wants the space act in zero g; the crowd
+    /// takes it with `take_space_wish`.
+    space_wish: bool,
     /// How he feels after meeting another Clawd, and for how much longer.
     feel: Option<(Feel, f32)>,
 }
@@ -363,6 +370,7 @@ impl Actor {
             mode: Mode::Fall { vy: 0.0, frame: 0 },
             walk_frame: 0,
             next_act_in: rng.range(ACT_GAP.0, ACT_GAP.1),
+            space_wish: false,
             walk: sheet_index("walk"),
             space: sheet_index("space"),
             turning: act_index("turning"),
@@ -406,6 +414,12 @@ impl Actor {
     /// Seconds since he last set off walking; zero when not walking.
     pub fn walking_for(&self) -> f32 {
         if self.is_walking() { self.walking_for } else { 0.0 }
+    }
+
+    /// Whether an act came due and he wants the space act in zero g;
+    /// clears the wish.
+    pub fn take_space_wish(&mut self) -> bool {
+        std::mem::take(&mut self.space_wish)
     }
 
     /// Floating in zero g, on his own space act or along beside one.
@@ -1058,6 +1072,13 @@ impl Actor {
         }
         self.next_act_in -= DT;
         if self.next_act_in <= 0.0 {
+            if rng.f32() < SPACE_CHANCE {
+                // Keep walking until the crowd sends him up; if it cannot,
+                // an ordinary act comes soon.
+                self.space_wish = true;
+                self.next_act_in = 2.0;
+                return;
+            }
             if s.ground && s.x1 - s.x0 >= 600 && rng.f32() < RIDE_CHANCE {
                 let sheet = sheet_index(RIDES[(rng.next_u64() % RIDES.len() as u64) as usize]);
                 let (lo, hi) = self.bounds(s);

@@ -8,7 +8,7 @@ Clawd, the pixel lobster from claude.dev, walks along the top edges of your wind
 
 - **Surfaces**: he walks on the visible top edge of every window and on the taskbar, turns at the ends, and rides along when you drag the window he is standing on.
 - **Falling**: when that window closes, minimizes or moves out from under him, he falls to the next edge below.
-- **Zero g**: when he plays the space act, gravity turns off for him and he floats around until it ends.
+- **Zero g**: now and then (about once every 20 to 30 minutes per Clawd) he plays the space act, gravity turns off for him and he floats around until it ends.
 - **Company**: with more than one Clawd, each keeps his own pace and timers, and two walking into each other never pass through. When two meet head on they stop and face each other for a beat before one turns, as if chatting; now and then one climbs on the other and rides him for a moment (never three high), and rarely the one who was walking longer shoves, so the other hops over him and lands behind with a startled "?!". While Claude Code is locked in, or when one walks up to another at his laptop, they sit down with their laptops back to back or facing each other. A chat or a ride leaves him happy, a shove annoyed, and that leans his next act. None of it lasts more than about three seconds, apart from the laptops, which are ordinary laptop acts.
 
 He hides while a fullscreen app is in front.
