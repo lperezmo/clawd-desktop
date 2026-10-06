@@ -5,6 +5,7 @@
 mod actor;
 mod config;
 mod crowd;
+mod hit;
 mod install;
 mod leans;
 mod overlay;
@@ -20,7 +21,7 @@ use actor::{Pose, Rng, Trigger, World};
 use config::Config;
 use crowd::Crowd;
 use log::{debug, info, warn};
-use overlay::Overlay;
+use overlay::{Mouse, Overlay};
 use sprites::{ACTS, FPS, act_index, frame, max_size, sheet_index};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -36,15 +37,15 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED,
     EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
-    GetAncestor, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE, PeekMessageW,
-    QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_QUIT,
-    WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GetAncestor, GetSystemMetrics, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE,
+    PeekMessageW, QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW, SM_CXDRAG, TranslateMessage,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION,
+    WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::w;
 
@@ -290,6 +291,21 @@ struct View {
     overlays: Vec<Overlay>,
     buf: Vec<u32>,
     buf_key: Option<u64>,
+    /// Where `buf` last went on screen: top-left, width and height.
+    origin: (i32, i32),
+    size: (i32, i32),
+}
+
+/// The left button went down on a Clawd and is not up yet.
+#[derive(Clone, Copy, Debug)]
+struct Press {
+    clawd: usize,
+    at: (i32, i32),
+    /// From the cursor to his centre line and feet.
+    offset: (i32, i32),
+    dragging: bool,
+    /// The second press of a double click: its release is not a click.
+    double: bool,
 }
 
 struct App {
@@ -308,6 +324,9 @@ struct App {
     last_foreground_react: Option<Instant>,
     /// A foreground change waiting for `FOREGROUND_DELAY`.
     pending_foreground: Option<Instant>,
+    press: Option<Press>,
+    /// A single click waiting out the double-click time: Clawd and when.
+    pending_click: Option<(usize, Instant)>,
     last_rebuild: Instant,
     frames_drawn: u64,
     steps: u64,
@@ -470,6 +489,8 @@ impl App {
         }
         let (sw, sh) = (f.w as i32 * s, f.h as i32 * s);
         let pos = (f.left(pose.x, s, pose.mirrored), pose.y - sh);
+        v.origin = pos;
+        v.size = (sw, sh);
         let mut drew = false;
         for o in &mut v.overlays {
             drew |= o.show(&v.buf, sw, sh, pos, key);
@@ -548,6 +569,104 @@ impl App {
         }
     }
 
+    fn set_clickable(&mut self, on: bool) {
+        overlay::set_clickable_default(on);
+        for v in &mut self.views {
+            for o in &mut v.overlays {
+                o.set_clickable(on);
+            }
+        }
+        if !on {
+            self.drop_press();
+        }
+    }
+
+    /// Which Clawd an overlay window belongs to.
+    fn clawd_of(&self, id: isize) -> Option<usize> {
+        self.views.iter().position(|v| v.overlays.iter().any(|o| o.id() == id))
+    }
+
+    /// Lets go of whatever the mouse was holding.
+    fn drop_press(&mut self) {
+        if let Some(p) = self.press.take()
+            && p.dragging
+            && let Some(m) = self.crowd.members.get_mut(p.clawd)
+        {
+            m.actor.release();
+        }
+    }
+
+    /// One act for Clawd `i` because of the user: `names` to pick from, or
+    /// the usual weighted pick with the leans when empty.
+    fn play_for_user(&mut self, i: usize, names: &[&str], then_hop: bool) {
+        let Some(m) = self.crowd.members.get_mut(i) else { return };
+        let act = if names.is_empty() {
+            m.actor.pick(&self.leans, &mut m.rng)
+        } else {
+            act_index(names[(m.rng.next_u64() % names.len() as u64) as usize])
+        };
+        if m.actor.react(act, Trigger::User, then_hop) {
+            info!("Clawd {i} plays {}", ACTS[act].name);
+        }
+    }
+
+    /// Clicks, double clicks, drags and right clicks on a Clawd.
+    fn mouse(&mut self, m: Mouse, now: Instant) -> bool {
+        match m {
+            Mouse::Down(id, p) | Mouse::Double(id, p) => {
+                let Some(i) = self.clawd_of(id) else { return false };
+                let v = &self.views[i];
+                if !hit::opaque_at(&v.buf, v.origin, v.size.0, v.size.1, p) {
+                    debug!("press at {p:?} missed Clawd {i}'s pixels");
+                    return false;
+                }
+                let a = self.crowd.members[i].actor.pose();
+                let double = matches!(m, Mouse::Double(..));
+                self.press = Some(Press {
+                    clawd: i,
+                    at: p,
+                    offset: (a.x - p.0, a.y - p.1),
+                    dragging: false,
+                    double,
+                });
+                if double {
+                    self.pending_click = None;
+                    self.play_for_user(i, &react::CELEBRATION_ACTS, false);
+                }
+            }
+            Mouse::Move(_, p) => {
+                let Some(mut press) = self.press else { return false };
+                let slop = unsafe { GetSystemMetrics(SM_CXDRAG) }.max(2);
+                if !press.dragging && ((p.0 - press.at.0).abs() > slop || (p.1 - press.at.1).abs() > slop) {
+                    press.dragging = true;
+                    self.pending_click = None;
+                    self.crowd.members[press.clawd].actor.grab();
+                    info!("Clawd {} picked up", press.clawd);
+                }
+                if press.dragging {
+                    let a = &mut self.crowd.members[press.clawd].actor;
+                    a.drag_to(p.0 + press.offset.0, p.1 + press.offset.1);
+                    let pose = a.pose();
+                    self.render(press.clawd, pose);
+                }
+                self.press = Some(press);
+            }
+            Mouse::Up(..) => {
+                let Some(press) = self.press.take() else { return false };
+                if press.dragging {
+                    self.crowd.members[press.clawd].actor.release();
+                    info!("Clawd {} let go", press.clawd);
+                } else if !press.double {
+                    let wait = Duration::from_millis(unsafe { GetDoubleClickTime() } as u64);
+                    self.pending_click = Some((press.clawd, now + wait));
+                }
+            }
+            Mouse::Lost(_) => self.drop_press(),
+            Mouse::Right(..) => return true,
+        }
+        false
+    }
+
     fn set_scale(&mut self, s: i32) {
         self.scale = s;
         self.crowd.set_scale(s);
@@ -573,6 +692,10 @@ impl App {
                 self.set_count(n);
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
+            Command::ToggleClickable => {
+                self.cfg.clickable = !self.cfg.clickable;
+                self.set_clickable(self.cfg.clickable);
+            }
             Command::ToggleStartup => {
                 if let Err(e) = install::set_startup(!install::startup_enabled()) {
                     warn!("start with Windows: {e}");
@@ -716,6 +839,7 @@ fn run(args: &Args) -> i32 {
     let walk_h = sprites::SHEETS[sheet_index("walk")].h as i32;
     debug_assert_eq!(walk_h, SHEETS_WALK_H);
     let count = cfg.count;
+    overlay::set_clickable_default(cfg.clickable);
 
     let mut app = App {
         cfg,
@@ -731,6 +855,8 @@ fn run(args: &Args) -> i32 {
         leans: Vec::new(),
         last_foreground_react: None,
         pending_foreground: None,
+        press: None,
+        pending_click: None,
         last_rebuild: Instant::now(),
         frames_drawn: 0,
         steps: 0,
@@ -809,6 +935,21 @@ fn run(args: &Args) -> i32 {
         }
 
         let now = Instant::now();
+        let mut menu = false;
+        for m in overlay::take_mouse() {
+            if !app.hidden {
+                menu |= app.mouse(m, now);
+            }
+        }
+        if menu && let Some(cmd) = tray.menu(&app.cfg) {
+            running &= app.handle(cmd);
+        }
+        if let Some((i, at)) = app.pending_click
+            && now >= at
+        {
+            app.pending_click = None;
+            app.play_for_user(i, &[], false);
+        }
         if deadline.is_some_and(|d| now >= d) {
             info!("--run-for elapsed after {:.1} s", (now - started).as_secs_f32());
             running = false;

@@ -42,7 +42,6 @@ pub fn acts_for(kind: WindowKind) -> &'static [&'static str] {
 pub const FOREGROUND_ACTS: [&str; 2] = ["turning", "looking"];
 
 /// What a double click, or Claude Code celebrating, may start.
-#[allow(dead_code)] // used once clicks land
 pub const CELEBRATION_ACTS: [&str; 11] = [
     "confetti",
     "confettiHappy",

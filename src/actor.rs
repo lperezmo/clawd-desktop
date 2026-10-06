@@ -172,6 +172,10 @@ enum Mode {
         step: usize,
         twice: bool,
     },
+    /// Picked up with the mouse: dangles, turning, wherever he is put.
+    Drag {
+        frame: usize,
+    },
 }
 
 /// Everything the renderer needs: which frame, which way, where the feet are.
@@ -244,7 +248,7 @@ impl Actor {
     /// Whether a reaction from `trigger` may start now.
     pub fn can_react(&self, trigger: Trigger) -> bool {
         match self.mode {
-            Mode::Fall { .. } => false,
+            Mode::Fall { .. } | Mode::Drag { .. } => false,
             _ if trigger == Trigger::User => true,
             Mode::Walk => self.rest <= 0.0,
             Mode::Act { kind, .. } => self.rest <= 0.0 && !matches!(kind, ActKind::Reaction { .. }),
@@ -267,6 +271,33 @@ impl Actor {
         true
     }
 
+    pub fn is_dragged(&self) -> bool {
+        matches!(self.mode, Mode::Drag { .. })
+    }
+
+    /// Picked up: whatever he was doing stops and he dangles.
+    pub fn grab(&mut self) {
+        if !self.is_dragged() {
+            self.mode = Mode::Drag { frame: 0 };
+        }
+    }
+
+    /// Carried to (`x`, `y`): his centre line and feet, screen pixels.
+    pub fn drag_to(&mut self, x: i32, y: i32) {
+        if self.is_dragged() {
+            self.x = x as f32;
+            self.y = y as f32;
+        }
+    }
+
+    /// Let go: he falls onto the first surface below his feet.
+    pub fn release(&mut self) {
+        if self.is_dragged() {
+            self.owner = GROUND;
+            self.start_fall();
+        }
+    }
+
     pub fn turn_around(&mut self) {
         self.dir = -self.dir;
     }
@@ -278,6 +309,7 @@ impl Actor {
             Mode::Ride { sheet, .. } => format!("ride {}", SHEETS[sheet].name),
             Mode::Fall { .. } => "fall".into(),
             Mode::Hop { .. } => "hop".into(),
+            Mode::Drag { .. } => "drag".into(),
         }
     }
 
@@ -287,7 +319,7 @@ impl Actor {
             Mode::Walk => (SpriteRef::Sheet(self.walk), self.walk_frame, 0),
             Mode::Act { act, frame, .. } => (SpriteRef::Act(act), frame, 0),
             Mode::Ride { sheet, frame, .. } => (SpriteRef::Sheet(sheet), frame, 0),
-            Mode::Fall { frame, .. } => (SpriteRef::Act(self.turning), frame, 0),
+            Mode::Fall { frame, .. } | Mode::Drag { frame } => (SpriteRef::Act(self.turning), frame, 0),
             Mode::Hop { step, .. } => (
                 SpriteRef::Sheet(self.walk),
                 0,
@@ -322,6 +354,12 @@ impl Actor {
     /// Advances one frame.
     pub fn step(&mut self, world: &World, rng: &mut Rng) {
         self.rest = (self.rest - DT).max(0.0);
+        if let Mode::Drag { frame } = self.mode {
+            self.mode = Mode::Drag {
+                frame: (frame + 1) % frame_count(SpriteRef::Act(self.turning)),
+            };
+            return;
+        }
         let xi = self.x.round() as i32;
         let yi = self.y.round() as i32;
 
@@ -405,7 +443,7 @@ impl Actor {
                     self.start_walk(rng);
                 }
             }
-            Mode::Fall { .. } => unreachable!(),
+            Mode::Fall { .. } | Mode::Drag { .. } => unreachable!(),
         }
     }
 
@@ -781,6 +819,50 @@ mod tests {
         assert!(!a.can_react(Trigger::Desktop));
         a.mode = Mode::Hop { step: 0, twice: false };
         assert!(!a.can_react(Trigger::Desktop));
+    }
+
+    #[test]
+    fn dragged_he_dangles_then_drops_onto_the_surface_below() {
+        let ws = [WindowInfo {
+            hwnd: 5,
+            rect: Rect::new(200, 600, 1200, 900),
+        }];
+        let s = build(&ws, &[mon()], 72);
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        let mut rng = Rng::new(8);
+        let mut a = walker(&mut rng, &s);
+        assert!(a.react(act_index("coffee"), Trigger::Desktop, false));
+        a.grab();
+        assert!(a.is_dragged());
+        // No reaction of any kind while carried.
+        assert!(!a.can_react(Trigger::Desktop));
+        assert!(!a.react(act_index("dancing"), Trigger::User, true));
+        a.drag_to(700, 300);
+        for _ in 0..30 {
+            a.step(&world, &mut rng);
+            assert!(a.is_dragged());
+            assert_eq!((a.pose().x, a.pose().y), (700, 300), "stays where he is held");
+            assert_eq!(a.pose().sprite, SpriteRef::Act(act_index("turning")));
+        }
+        a.release();
+        assert!(a.is_falling());
+        assert!(!a.can_react(Trigger::User), "no reaction during the fall either");
+        for _ in 0..60 {
+            a.step(&world, &mut rng);
+        }
+        assert_eq!(a.pose().y, 600, "landed on the window under the cursor");
+        // Dropped beside the window: the ground.
+        a.grab();
+        a.drag_to(1500, 300);
+        a.release();
+        for _ in 0..60 {
+            a.step(&world, &mut rng);
+        }
+        assert_eq!(a.pose().y, 1032);
     }
 
     #[test]

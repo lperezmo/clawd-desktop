@@ -15,6 +15,8 @@ pub struct Config {
     pub hide_fullscreen: bool,
     /// How many Clawds walk at once, 1 to 5.
     pub count: usize,
+    /// His pixels take the mouse: click, double click, drag, right click.
+    pub clickable: bool,
 }
 
 impl Default for Config {
@@ -24,6 +26,7 @@ impl Default for Config {
             paused: false,
             hide_fullscreen: true,
             count: 1,
+            clickable: true,
         }
     }
 }
@@ -83,6 +86,7 @@ mod tests {
             paused: true,
             hide_fullscreen: false,
             count: 4,
+            clickable: false,
         };
         let s = toml::to_string(&c).unwrap();
         assert_eq!(toml::from_str::<Config>(&s).unwrap(), c);
@@ -95,6 +99,7 @@ mod tests {
             }
         );
         assert_eq!(partial.count, 1);
+        assert!(partial.clickable, "clickable by default");
         let three: Config = toml::from_str(
             "count = 3
 paused = true",
