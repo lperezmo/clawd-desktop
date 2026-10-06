@@ -1,6 +1,35 @@
 # CHANGELOG
 
 
+## v0.2.0 (2026-10-06)
+
+### Chores
+
+- Keep only the exe on a GitHub release
+  ([`bb53dec`](https://github.com/lperezmo/clawd-desktop/commit/bb53dec4a3d685c66156776c3da18cf50d4fda08))
+
+### Features
+
+- Variety pack: shorter acts, clickable Clawd, desktop reactions, Claude Code mood, Perform
+  ([#1](https://github.com/lperezmo/clawd-desktop/pull/1),
+  [`0a410e5`](https://github.com/lperezmo/clawd-desktop/commit/0a410e553ed6b383a8aad3694646e8d0c71d6f87))
+
+* feat: an act every 8 to 20 seconds, and one in four chains into a second
+
+* feat: Clawd reacts to new terminal, browser and Explorer windows and to focus changes, and leans
+  on the clock, battery and media
+
+* feat: a clickable Clawd: click for an act, double click to celebrate, drag to carry him, right
+  click for the menu
+
+* feat: follow Claude Code's mood from clawd-buddy's session files: lock in and chill lean the
+  picks, a celebration makes every Clawd celebrate
+
+* feat: Perform from the tray, Ctrl+Alt+C or --perform makes every Clawd play an act now
+
+* docs: README for what makes him do things, Clickable, Follow Claude Code and Perform
+
+
 ## v0.1.0 (2026-10-06)
 
 ### Chores
