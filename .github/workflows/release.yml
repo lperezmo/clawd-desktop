@@ -53,3 +53,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: gh release upload "${{ needs.release.outputs.tag }}" dist/*.exe --clobber
+      - name: Drop the Cargo.lock asset semantic-release attaches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: gh release delete-asset "${{ needs.release.outputs.tag }}" Cargo.lock --yes; exit 0
