@@ -8,6 +8,7 @@ Clawd, the pixel lobster from claude.dev, walks along the top edges of your wind
 
 - **Surfaces**: he walks on the visible top edge of every window and on the taskbar, turns at the ends, and rides along when you drag the window he is standing on.
 - **Falling**: when that window closes, minimizes or moves out from under him, he falls to the next edge below.
+- **Zero g**: when he plays the space act, gravity turns off for him and he floats around until it ends.
 - **Company**: with more than one Clawd, each keeps his own pace and timers, and two walking into each other never pass through. When two meet head on they stop and face each other for a beat before one turns, as if chatting; now and then one climbs on the other and rides him for a moment (never three high), and rarely the one who was walking longer shoves, so the other hops over him and lands behind with a startled "?!". While Claude Code is locked in, or when one walks up to another at his laptop, they sit down with their laptops back to back or facing each other. A chat or a ride leaves him happy, a shove annoyed, and that leans his next act. None of it lasts more than about three seconds, apart from the laptops, which are ordinary laptop acts.
 
 He hides while a fullscreen app is in front.
@@ -21,7 +22,7 @@ He hides while a fullscreen app is in front.
 - **Windows going away**: closing or minimizing the window he stands on drops him to the next edge below.
 - **Leans** (tilt the usual pick, never force it): media playing leans toward headphones and dancing, under 20 percent battery toward a snooze, 7 to 10 am toward coffee, 1 to 4 pm toward sunglasses, 11 pm to 6 am toward a snooze.
 - **Claude Code** (with [clawd-buddy](https://github.com/lperezmo/clawd-buddy) 1.12 or later): while a session is locked in he leans toward the laptop, desktop, notebook, phone, thinking and coffee; while chill, toward the idle acts; when one celebrates, every Clawd celebrates at once and hops.
-- **You**: click him for an act, double click to celebrate, drag to pick him up (he drops onto the nearest edge below when you let go), right click for the tray menu.
+- **You**: click him for an act, double click to celebrate, drag to pick him up (he drops onto the nearest edge below when you let go), right click for the tray menu with Float on top, which sends that Clawd up for the space act in zero g.
 - **Perform**: the tray item, Ctrl+Alt+C or `--perform` makes every Clawd play an act now.
 
 Reactions are over in about three seconds (a laptop or desktop session in under ten) and never interrupt a fall or a drag.

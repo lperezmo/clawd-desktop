@@ -30,6 +30,8 @@ pub enum Command {
     ToggleFollow,
     ToggleAntics,
     Perform,
+    /// The Clawd the menu was opened on plays the space act in zero g.
+    Float,
     Quit,
 }
 
@@ -41,6 +43,7 @@ const ID_CLICKABLE: usize = 5;
 const ID_FOLLOW: usize = 6;
 const ID_PERFORM: usize = 7;
 const ID_ANTICS: usize = 8;
+const ID_FLOAT: usize = 9;
 const ID_SCALE: usize = 100;
 const ID_COUNT: usize = 200;
 
@@ -103,7 +106,8 @@ impl Tray {
     }
 
     /// Shows the menu at the cursor and returns the chosen command.
-    pub fn menu(&self, cfg: &Config) -> Option<Command> {
+    /// `on_clawd`: opened with a right click on a Clawd, which adds Float.
+    pub fn menu(&self, cfg: &Config, on_clawd: bool) -> Option<Command> {
         unsafe {
             let m = CreatePopupMenu().ok()?;
             let scales = CreatePopupMenu().ok()?;
@@ -118,6 +122,10 @@ impl Tray {
                 let _ = AppendMenuW(counts, MF_STRING | check(cfg.count == n), ID_COUNT + n, &label);
             }
             let pause = if cfg.paused { w!("Resume") } else { w!("Pause") };
+            if on_clawd {
+                let _ = AppendMenuW(m, MF_STRING, ID_FLOAT, w!("Float"));
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
+            }
             let _ = AppendMenuW(m, MF_STRING, ID_PERFORM, w!("Perform\tCtrl+Alt+C"));
             let _ = AppendMenuW(m, MF_STRING, ID_PAUSE, pause);
             let _ = AppendMenuW(m, MF_STRING | MF_POPUP, counts.0 as usize, w!("Clawds"));
@@ -162,20 +170,26 @@ impl Tray {
             .0 as usize;
             let _ = PostMessageW(Some(self.hwnd), WM_NULL, Default::default(), Default::default());
             let _ = DestroyMenu(m);
-            match id {
-                ID_PAUSE => Some(Command::TogglePause),
-                ID_FULLSCREEN => Some(Command::ToggleFullscreen),
-                ID_STARTUP => Some(Command::ToggleStartup),
-                ID_CLICKABLE => Some(Command::ToggleClickable),
-                ID_FOLLOW => Some(Command::ToggleFollow),
-                ID_ANTICS => Some(Command::ToggleAntics),
-                ID_PERFORM => Some(Command::Perform),
-                ID_QUIT => Some(Command::Quit),
-                n if n > ID_COUNT => Some(Command::Count(n - ID_COUNT)),
-                n if n > ID_SCALE => Some(Command::Scale((n - ID_SCALE) as i32)),
-                _ => None,
-            }
+            command(id)
         }
+    }
+}
+
+/// The command behind a menu item id; None for a dismissed menu.
+fn command(id: usize) -> Option<Command> {
+    match id {
+        ID_PAUSE => Some(Command::TogglePause),
+        ID_FULLSCREEN => Some(Command::ToggleFullscreen),
+        ID_STARTUP => Some(Command::ToggleStartup),
+        ID_CLICKABLE => Some(Command::ToggleClickable),
+        ID_FOLLOW => Some(Command::ToggleFollow),
+        ID_ANTICS => Some(Command::ToggleAntics),
+        ID_PERFORM => Some(Command::Perform),
+        ID_FLOAT => Some(Command::Float),
+        ID_QUIT => Some(Command::Quit),
+        n if n > ID_COUNT => Some(Command::Count(n - ID_COUNT)),
+        n if n > ID_SCALE => Some(Command::Scale((n - ID_SCALE) as i32)),
+        _ => None,
     }
 }
 
@@ -186,6 +200,37 @@ impl Drop for Tray {
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_menu_item_maps_to_its_command() {
+        assert_eq!(command(ID_FLOAT), Some(Command::Float));
+        assert_eq!(command(ID_PERFORM), Some(Command::Perform));
+        assert_eq!(command(ID_QUIT), Some(Command::Quit));
+        assert_eq!(command(ID_SCALE + 4), Some(Command::Scale(4)));
+        assert_eq!(command(ID_COUNT + 3), Some(Command::Count(3)));
+        assert_eq!(command(0), None, "dismissed");
+        // The plain items stay clear of the scale and count ranges.
+        let plain = [
+            ID_PAUSE,
+            ID_FULLSCREEN,
+            ID_STARTUP,
+            ID_QUIT,
+            ID_CLICKABLE,
+            ID_FOLLOW,
+            ID_PERFORM,
+            ID_ANTICS,
+            ID_FLOAT,
+        ];
+        for (k, id) in plain.iter().enumerate() {
+            assert!(*id < ID_SCALE);
+            assert!(!plain[k + 1..].contains(id), "{id} used twice");
         }
     }
 }

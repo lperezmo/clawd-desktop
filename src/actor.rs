@@ -2,7 +2,7 @@
 //! of one animation frame (1/12 s) and knows nothing about Win32.
 
 use crate::sprites::{ACTS, FPS, SHEETS, SpriteRef, act_index, frame_count, sheet_index};
-use crate::surfaces::{GROUND, Surface, fall_target, nearest_ground, support};
+use crate::surfaces::{GROUND, Rect, Surface, fall_target, nearest_ground, support};
 
 /// splitmix64: small, seedable, good enough for picking acts.
 #[derive(Clone)]
@@ -76,6 +76,25 @@ pub const STARTLE_FRAMES: usize = 15;
 const SHAKE_FRAMES: usize = 6;
 /// Frames a Clawd rides on another before he gets down.
 pub const PERCH_FRAMES: usize = 18;
+
+/// Zero g: fastest he drifts, sprite pixels per second.
+pub const FLOAT_CAP: f32 = 8.0;
+/// How fast he lifts off while suiting up, sprite pixels per second.
+const LIFT_SPEED: f32 = 7.0;
+/// Seconds of drifting about, between suiting up and coming back down.
+pub const FLOAT_CRUISE: (f32, f32) = (6.0, 10.0);
+/// Seconds between changes of drift.
+const DRIFT_EVERY: (f32, f32) = (1.5, 4.0);
+/// How much of the gap to the new drift he closes each frame.
+const DRIFT_EASE: f32 = 0.08;
+/// A passenger's short float eases faster, so it shows.
+const PASSENGER_EASE: f32 = 0.25;
+/// The soft bob while floating: sprite pixels up, and frames per bob.
+const BOB: f32 = 2.0;
+const BOB_FRAMES: f32 = 36.0;
+/// A Clawd beside a floater floats along this long, then drops: well
+/// inside three seconds with the fall and the landing hop.
+pub const PASSENGER_FRAMES: usize = 20;
 
 /// How a Clawd feels after meeting another. It leans his next act, once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +262,54 @@ enum Mode {
     Perch {
         left: usize,
     },
+    /// Zero g: drifting through the air, surfaces ignored.
+    Float(Float),
+}
+
+/// A float: the space sheet played in the air, or a short float along
+/// beside someone who is playing it (`passenger`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Float {
+    frame: usize,
+    cruise: usize,
+    /// Seconds of drifting left before he heads into the outro.
+    left: f32,
+    /// Frames since he lifted off.
+    t: usize,
+    /// Drift now and the drift he is easing toward, sprite pixels per second.
+    v: (f32, f32),
+    target: (f32, f32),
+    /// Seconds until the drift changes.
+    next: f32,
+    /// The work area of the monitor he is on: he stays inside it.
+    area: Rect,
+    passenger: bool,
+}
+
+/// The work area that (`x`, `y`) is in, or the one under `x`.
+fn area_at(areas: &[Rect], x: i32, y: i32) -> Option<Rect> {
+    let under = |r: &&Rect| x >= r.left && x < r.right;
+    areas
+        .iter()
+        .filter(under)
+        .find(|r| y >= r.top && y <= r.bottom)
+        .or_else(|| areas.iter().find(under))
+        .copied()
+}
+
+/// Keeps one coordinate inside `lo..=hi`: hitting a wall turns the drift
+/// back inward, and from outside (lifting off near an edge) he glides back
+/// in `edge` screen pixels a frame.
+fn wall(p: &mut f32, old: f32, v: &mut f32, target: &mut f32, lo: f32, hi: f32, edge: f32) {
+    if *p < lo {
+        *p = if old < lo { (old + edge).min(lo) } else { lo };
+        *v = v.abs();
+        *target = target.abs();
+    } else if *p > hi {
+        *p = if old > hi { (old - edge).max(hi) } else { hi };
+        *v = -v.abs();
+        *target = -target.abs();
+    }
 }
 
 /// Everything the renderer needs: which frame, which way, where the feet are.
@@ -271,6 +338,7 @@ pub struct Actor {
     walk_frame: usize,
     next_act_in: f32,
     walk: usize,
+    space: usize,
     turning: usize,
     weights: Vec<f32>,
     sleepy: Vec<f32>,
@@ -296,6 +364,7 @@ impl Actor {
             walk_frame: 0,
             next_act_in: rng.range(ACT_GAP.0, ACT_GAP.1),
             walk: sheet_index("walk"),
+            space: sheet_index("space"),
             turning: act_index("turning"),
             weights: act_weights(),
             sleepy: sleepy_weights(),
@@ -337,6 +406,62 @@ impl Actor {
     /// Seconds since he last set off walking; zero when not walking.
     pub fn walking_for(&self) -> f32 {
         if self.is_walking() { self.walking_for } else { 0.0 }
+    }
+
+    /// Floating in zero g, on his own space act or along beside one.
+    pub fn is_floating(&self) -> bool {
+        matches!(self.mode, Mode::Float(_))
+    }
+
+    /// Starts the space act with gravity off: he lifts off gently, drifts
+    /// about inside the work area he is in (one of `areas`), then drops
+    /// back down when it ends. False when he is held, falling, already
+    /// floating, or not over any work area.
+    pub fn float(&mut self, areas: &[Rect], rng: &mut Rng) -> bool {
+        self.lift_off(areas, false, rng)
+    }
+
+    /// Floats along for a moment beside one who started the space act,
+    /// then drops. Only from his feet: not while held, falling, leaping or
+    /// riding on someone.
+    pub fn float_along(&mut self, areas: &[Rect], rng: &mut Rng) -> bool {
+        if self.is_social() {
+            return false;
+        }
+        self.lift_off(areas, true, rng)
+    }
+
+    fn lift_off(&mut self, areas: &[Rect], passenger: bool, rng: &mut Rng) -> bool {
+        if matches!(self.mode, Mode::Fall { .. } | Mode::Drag { .. } | Mode::Float(_)) {
+            return false;
+        }
+        // From where he is seen: up on a leap or a head.
+        let y = self.y - self.lift() * self.scale as f32;
+        let Some(area) = area_at(areas, self.x.round() as i32, y.round() as i32) else {
+            return false;
+        };
+        self.y = y;
+        self.owner = GROUND;
+        self.mode = Mode::Float(Float {
+            frame: 0,
+            cruise: 0,
+            left: rng.range(FLOAT_CRUISE.0, FLOAT_CRUISE.1),
+            t: 0,
+            v: (0.0, 0.0),
+            target: (0.0, -LIFT_SPEED),
+            next: 0.0,
+            area,
+            passenger,
+        });
+        true
+    }
+
+    /// Screen pixels the bob lifts him at frame `t` of a float.
+    fn bob(&self, f: &Float) -> f32 {
+        let amp = if f.passenger { BOB / 2.0 } else { BOB };
+        let ramp = (f.t as f32 / BOB_FRAMES).min(1.0);
+        let wave = (1.0 - (std::f32::consts::TAU * f.t as f32 / BOB_FRAMES).cos()) / 2.0;
+        amp * ramp * wave * self.scale as f32
     }
 
     /// The act he is playing, if any.
@@ -453,7 +578,7 @@ impl Actor {
     /// Whether a reaction from `trigger` may start now.
     pub fn can_react(&self, trigger: Trigger) -> bool {
         match self.mode {
-            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Leap { .. } | Mode::Perch { .. } => false,
+            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Leap { .. } | Mode::Perch { .. } | Mode::Float(_) => false,
             _ if trigger == Trigger::User => true,
             Mode::Walk => self.rest <= 0.0,
             Mode::Act { kind, .. } => self.rest <= 0.0 && !matches!(kind, ActKind::Reaction { .. }),
@@ -519,6 +644,8 @@ impl Actor {
             Mode::Stand { .. } => "stand".into(),
             Mode::Leap { .. } => "leap".into(),
             Mode::Perch { .. } => "perch".into(),
+            Mode::Float(Float { passenger: true, .. }) => "float along".into(),
+            Mode::Float(_) => "float".into(),
         }
     }
 
@@ -544,6 +671,15 @@ impl Actor {
                 (SpriteRef::Sheet(self.walk), 0, 0)
             }
             Mode::Leap { .. } | Mode::Perch { .. } => (SpriteRef::Sheet(self.walk), 0, -lift),
+            Mode::Float(f) => {
+                let dy = -self.bob(&f).round() as i32;
+                if f.passenger {
+                    let n = frame_count(SpriteRef::Act(self.turning));
+                    (SpriteRef::Act(self.turning), f.t % n, dy)
+                } else {
+                    (SpriteRef::Sheet(self.space), f.frame, dy)
+                }
+            }
         };
         Pose {
             sprite,
@@ -600,6 +736,10 @@ impl Actor {
 
         if let Mode::Fall { vy, frame } = self.mode {
             self.fall_step(world, vy, frame, xi, yi, rng);
+            return;
+        }
+        if let Mode::Float(f) = self.mode {
+            self.float_step(f, rng);
             return;
         }
 
@@ -753,8 +893,113 @@ impl Actor {
                     self.mode = Mode::Perch { left: left - 1 };
                 }
             }
-            Mode::Fall { .. } | Mode::Drag { .. } => unreachable!(),
+            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Float(_) => unreachable!(),
         }
+    }
+
+    /// One frame of zero g. Surfaces do not matter up here; only the work
+    /// area's edges, which he bounces softly off. When the act is over he
+    /// falls like any other fall onto whatever is below.
+    fn float_step(&mut self, mut f: Float, rng: &mut Rng) {
+        let sh = &SHEETS[self.space];
+        f.t += 1;
+        let over = if f.passenger {
+            f.t >= PASSENGER_FRAMES
+        } else if f.frame >= sh.outro {
+            f.frame += 1;
+            f.frame >= sh.frames.len()
+        } else if f.frame + 1 < sh.launch {
+            f.frame += 1;
+            false
+        } else if f.left <= 0.0 || sh.cruise.is_empty() {
+            f.frame = sh.outro;
+            false
+        } else {
+            f.cruise = if f.frame < sh.launch {
+                0
+            } else {
+                (f.cruise + 1) % sh.cruise.len()
+            };
+            f.frame = sh.cruise[f.cruise];
+            f.left -= DT;
+            false
+        };
+        if over {
+            // Down from where he is seen, bob and all.
+            self.y -= self.bob(&f);
+            self.owner = GROUND;
+            self.start_fall();
+            return;
+        }
+
+        let lifting = if f.passenger {
+            f.t < PASSENGER_FRAMES * 2 / 3
+        } else {
+            f.frame < sh.launch
+        };
+        if lifting {
+            f.target = (0.0, -LIFT_SPEED);
+        } else if f.passenger || f.frame >= sh.outro {
+            f.target = (0.0, 0.0);
+        } else {
+            f.next -= DT;
+            if f.next <= 0.0 {
+                // A new drift; now and then he turns the other way.
+                if rng.f32() < 0.4 {
+                    self.dir = -self.dir;
+                }
+                f.target = (
+                    self.dir * rng.range(1.5, 0.75 * FLOAT_CAP),
+                    rng.range(-0.7, 0.35) * FLOAT_CAP,
+                );
+                f.next = rng.range(DRIFT_EVERY.0, DRIFT_EVERY.1);
+            }
+        }
+        let ease = if f.passenger { PASSENGER_EASE } else { DRIFT_EASE };
+        f.v.0 += (f.target.0 - f.v.0) * ease;
+        f.v.1 += (f.target.1 - f.v.1) * ease;
+        let speed = (f.v.0 * f.v.0 + f.v.1 * f.v.1).sqrt();
+        if speed > FLOAT_CAP {
+            f.v.0 *= FLOAT_CAP / speed;
+            f.v.1 *= FLOAT_CAP / speed;
+        }
+
+        let scale = self.scale as f32;
+        let (ox, oy) = (self.x, self.y);
+        self.x += f.v.0 * scale * DT;
+        self.y += f.v.1 * scale * DT;
+        let (w, h) = if f.passenger {
+            (SHEETS[self.walk].w, SHEETS[self.walk].h)
+        } else {
+            (sh.w, sh.h)
+        };
+        let half = (w / 2) as f32 * scale;
+        let a = f.area;
+        let edge = 0.4 * FLOAT_CAP * scale * DT;
+        let was = f.target.0;
+        wall(
+            &mut self.x,
+            ox,
+            &mut f.v.0,
+            &mut f.target.0,
+            a.left as f32 + half,
+            a.right as f32 - half,
+            edge,
+        );
+        if f.target.0 * was < 0.0 {
+            // Bounced off a side: he turns to face the new way.
+            self.dir = -self.dir;
+        }
+        wall(
+            &mut self.y,
+            oy,
+            &mut f.v.1,
+            &mut f.target.1,
+            a.top as f32 + (h as f32 + BOB) * scale,
+            a.bottom as f32,
+            edge,
+        );
+        self.mode = Mode::Float(f);
     }
 
     fn fall_step(&mut self, world: &World, vy: f32, frame: usize, xi: i32, yi: i32, rng: &mut Rng) {
@@ -1323,5 +1568,153 @@ mod tests {
             d == "act snooze" || d == "act meditating" || d == "act headphones",
             "{d}"
         );
+    }
+
+    // ---- zero g ----
+
+    /// Frames from lift-off to the end of the longest space act, and the
+    /// frames a fall from anywhere on the monitor takes to land.
+    fn longest_float() -> usize {
+        let sh = &SHEETS[sheet_index("space")];
+        sh.launch + (FLOAT_CRUISE.1 * FPS as f32) as usize + (sh.frames.len() - sh.outro) + 2
+    }
+    const LAND_FRAMES: usize = 24;
+
+    /// The sprite's box on screen for `p`: left, top, right, bottom.
+    fn sprite_box(p: Pose) -> (i32, i32, i32, i32) {
+        let f = crate::sprites::frame(p.sprite, p.frame);
+        let s = 4;
+        let left = f.left(p.x, s, p.mirrored);
+        (left, p.y - f.h as i32 * s, left + f.w as i32 * s, p.y)
+    }
+
+    #[test]
+    fn in_zero_g_he_floats_inside_the_work_area_then_lands() {
+        let ws = [
+            WindowInfo {
+                hwnd: 5,
+                rect: Rect::new(200, 600, 1200, 900),
+            },
+            WindowInfo {
+                hwnd: 6,
+                rect: Rect::new(1300, 400, 1900, 700),
+            },
+        ];
+        let s = build(&ws, &[mon()], 72);
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        let area = mon().work;
+        let cap = FLOAT_CAP * 4.0 / FPS as f32 + 0.01;
+        let mut turned = 0;
+        for seed in 0..40 {
+            let mut rng = Rng::new(seed);
+            let mut a = walker(&mut rng, &s);
+            // Start anywhere along the ground, edges included.
+            a.x = 60.0 + (seed as f32 * 457.0) % 1800.0;
+            let start = a.y;
+            assert!(a.float(&[area], &mut rng));
+            assert!(!a.float(&[area], &mut rng), "already floating");
+            assert!(!a.can_react(Trigger::User), "no reaction in the air");
+            let (mut frames, mut top, mut flips) = (0, start, 0);
+            let mut dir = a.dir;
+            let mut last_out = i32::MAX;
+            while a.is_floating() {
+                let (x, y) = (a.x, a.y);
+                a.step(&world, &mut rng);
+                frames += 1;
+                assert!(frames <= longest_float(), "seed {seed}: still floating after {frames}");
+                let moved = ((a.x - x).powi(2) + (a.y - y).powi(2)).sqrt();
+                if a.is_floating() {
+                    assert!(moved <= cap, "seed {seed}: {moved} px in a frame");
+                    let (l, t, r, b) = sprite_box(a.pose());
+                    let out = (area.left - l)
+                        .max(r - area.right)
+                        .max(area.top - t)
+                        .max(b - area.bottom);
+                    // Lifting off right by an edge, the wider suit may start
+                    // a little past it; he glides back in during the lead in.
+                    assert!(
+                        out <= 0 || (frames < SHEETS[sheet_index("space")].launch && out < last_out),
+                        "seed {seed}: out of the work area at {:?} after {frames} frames",
+                        (l, t, r, b)
+                    );
+                    assert!(
+                        a.y <= area.bottom as f32 && a.y >= area.top as f32,
+                        "seed {seed}: feet left the area"
+                    );
+                    last_out = out;
+                    top = top.min(a.y);
+                    flips += (a.dir != dir) as u32;
+                    dir = a.dir;
+                }
+            }
+            assert!(
+                frames >= SHEETS[sheet_index("space")].frames.len(),
+                "seed {seed}: {frames}"
+            );
+            assert!(
+                start - top >= 10.0 * 4.0,
+                "seed {seed}: barely left the ground ({})",
+                start - top
+            );
+            turned += (flips >= 1) as u32;
+            // Gravity is back: he falls onto whatever is below and walks on.
+            assert!(a.is_falling(), "{}", a.describe());
+            let mut landed = None;
+            for k in 0..LAND_FRAMES {
+                a.step(&world, &mut rng);
+                if !a.is_falling() {
+                    landed = Some(k);
+                    break;
+                }
+            }
+            assert!(landed.is_some(), "seed {seed}: no landing within {LAND_FRAMES} frames");
+            let y = a.y.round() as i32;
+            assert!(
+                s.iter().any(|s| s.y == y && s.contains_x(a.x as i32)),
+                "seed {seed}: landed on nothing at {y}"
+            );
+            for _ in 0..12 {
+                a.step(&world, &mut rng);
+            }
+            assert!(a.is_walking(), "seed {seed}: {}", a.describe());
+        }
+        // Now and then he turns the other way while drifting.
+        assert!(turned >= 30, "only {turned} of 40 floats turned");
+    }
+
+    #[test]
+    fn picked_up_in_zero_g_the_float_is_over() {
+        let s = build(&[], &[mon()], 72);
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        let mut rng = Rng::new(31);
+        let mut a = walker(&mut rng, &s);
+        assert!(a.float(&[mon().work], &mut rng));
+        for _ in 0..40 {
+            a.step(&world, &mut rng);
+        }
+        assert!(a.is_floating());
+        assert_eq!(a.pose().sprite, SpriteRef::Sheet(sheet_index("space")));
+        a.grab();
+        assert!(a.is_dragged());
+        assert!(!a.float(&[mon().work], &mut rng), "not while held");
+        a.drag_to(700, 300);
+        a.release();
+        assert!(!a.float(&[mon().work], &mut rng), "not while falling");
+        for _ in 0..LAND_FRAMES {
+            a.step(&world, &mut rng);
+        }
+        assert_eq!(a.pose().y, 1032);
+        // Off every work area: no float.
+        let mut b = walker(&mut rng, &s);
+        assert!(!b.float(&[Rect::new(3000, 0, 4000, 1000)], &mut rng));
+        assert!(b.is_walking());
     }
 }

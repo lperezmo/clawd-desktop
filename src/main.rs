@@ -357,6 +357,8 @@ struct App {
     press: Option<Press>,
     /// A single click waiting out the double-click time: Clawd and when.
     pending_click: Option<(usize, Instant)>,
+    /// The Clawd the open menu was opened on with a right click.
+    menu_clawd: Option<usize>,
     last_rebuild: Instant,
     frames_drawn: u64,
     steps: u64,
@@ -740,7 +742,10 @@ impl App {
                 }
             }
             Mouse::Lost(_) => self.drop_press(),
-            Mouse::Right(..) => return true,
+            Mouse::Right(id, _) => {
+                self.menu_clawd = self.clawd_of(id);
+                return true;
+            }
         }
         false
     }
@@ -771,6 +776,12 @@ impl App {
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
             Command::Perform => self.perform(),
+            Command::Float => {
+                if let Some(i) = self.menu_clawd.take() {
+                    self.float(i);
+                }
+                return true;
+            }
             Command::ToggleFollow => {
                 self.cfg.follow_claude = !self.cfg.follow_claude;
                 self.set_follow(self.cfg.follow_claude);
@@ -873,6 +884,17 @@ fn signal_perform() {
 }
 
 impl App {
+    /// Clawd `i` plays the space act in zero g, inside the work area of
+    /// the monitor he is on.
+    fn float(&mut self, i: usize) {
+        let areas: Vec<surfaces::Rect> = self.monitors.iter().map(|m| m.work).collect();
+        if self.crowd.float(i, &areas) {
+            info!("Clawd {i} floats: {}", self.describe());
+        } else {
+            info!("Clawd {i} cannot float now");
+        }
+    }
+
     /// Every Clawd plays an act now, with the leans.
     fn perform(&mut self) {
         info!("perform");
@@ -982,6 +1004,7 @@ fn run(args: &Args) -> i32 {
         pending_foreground: None,
         press: None,
         pending_click: None,
+        menu_clawd: None,
         last_rebuild: Instant::now(),
         frames_drawn: 0,
         steps: 0,
@@ -1063,7 +1086,8 @@ fn run(args: &Args) -> i32 {
                 }
                 Event::NewWindow(_) | Event::Foreground(_) => {}
                 Event::TrayMenu => {
-                    if let Some(cmd) = tray.menu(&app.cfg) {
+                    app.menu_clawd = None;
+                    if let Some(cmd) = tray.menu(&app.cfg, false) {
                         running &= app.handle(cmd);
                     }
                 }
@@ -1082,9 +1106,10 @@ fn run(args: &Args) -> i32 {
                 menu |= app.mouse(m, now);
             }
         }
-        if menu && let Some(cmd) = tray.menu(&app.cfg) {
+        if menu && let Some(cmd) = tray.menu(&app.cfg, app.menu_clawd.is_some()) {
             running &= app.handle(cmd);
         }
+        app.menu_clawd = None;
         if let Some((i, at)) = app.pending_click
             && now >= at
         {
