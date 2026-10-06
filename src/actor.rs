@@ -5,6 +5,7 @@ use crate::sprites::{ACTS, FPS, SHEETS, SpriteRef, act_index, frame_count, sheet
 use crate::surfaces::{GROUND, Surface, fall_target, nearest_ground, support};
 
 /// splitmix64: small, seedable, good enough for picking acts.
+#[derive(Clone)]
 pub struct Rng(u64);
 
 impl Rng {
@@ -60,7 +61,7 @@ const RIDES: [&str; 4] = ["skate", "car", "scooter", "bike"];
 const RIDE_CHANCE: f32 = 0.2;
 const DT: f32 = 1.0 / FPS as f32;
 /// Half of Clawd's body width in sprite pixels: how close to an end he walks.
-const HALF_BODY: f32 = 8.0;
+pub const HALF_BODY: f32 = 8.0;
 const HOP: [i32; 4] = [-2, -3, -2, -1];
 
 /// What the world looks like this step.
@@ -109,6 +110,8 @@ pub struct Actor {
     pub y: f32,
     pub dir: f32,
     pub scale: i32,
+    /// This Clawd's pace: 0.85 to 1.15 times the sheet speed.
+    pub speed_mul: f32,
     owner: isize,
     mode: Mode,
     walk_frame: usize,
@@ -127,6 +130,7 @@ impl Actor {
             y: y as f32,
             dir: if rng.f32() < 0.5 { -1.0 } else { 1.0 },
             scale,
+            speed_mul: rng.range(0.85, 1.15),
             owner: GROUND,
             mode: Mode::Fall { vy: 0.0, frame: 0 },
             walk_frame: 0,
@@ -141,6 +145,15 @@ impl Actor {
     #[cfg(test)]
     pub fn is_falling(&self) -> bool {
         matches!(self.mode, Mode::Fall { .. })
+    }
+
+    /// Walking along a surface (not acting, riding, hopping or falling).
+    pub fn is_walking(&self) -> bool {
+        matches!(self.mode, Mode::Walk)
+    }
+
+    pub fn turn_around(&mut self) {
+        self.dir = -self.dir;
     }
 
     pub fn describe(&self) -> String {
@@ -342,7 +355,7 @@ impl Actor {
             self.x = (s.x0 + s.x1) as f32 / 2.0;
             return false;
         }
-        self.x += self.dir * speed * self.scale as f32 * DT;
+        self.x += self.dir * speed * self.speed_mul * self.scale as f32 * DT;
         if self.x >= hi && self.dir > 0.0 {
             self.x = hi;
             self.dir = -1.0;

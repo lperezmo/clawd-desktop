@@ -1,6 +1,7 @@
 //! Tray icon and its menu.
 
 use crate::config::{Config, SCALES};
+use crate::crowd::MAX_COUNT;
 use crate::install::startup_enabled;
 use log::warn;
 use windows::Win32::Foundation::{HWND, POINT};
@@ -22,6 +23,7 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 pub enum Command {
     TogglePause,
     Scale(i32),
+    Count(usize),
     ToggleFullscreen,
     ToggleStartup,
     Quit,
@@ -32,6 +34,7 @@ const ID_FULLSCREEN: usize = 2;
 const ID_STARTUP: usize = 3;
 const ID_QUIT: usize = 4;
 const ID_SCALE: usize = 100;
+const ID_COUNT: usize = 200;
 
 pub struct Tray {
     hwnd: HWND,
@@ -101,8 +104,14 @@ impl Tray {
                 let label = HSTRING::from(format!("{s}x"));
                 let _ = AppendMenuW(scales, MF_STRING | check(cfg.scale == s), ID_SCALE + s as usize, &label);
             }
+            let counts = CreatePopupMenu().ok()?;
+            for n in 1..=MAX_COUNT {
+                let label = HSTRING::from(n.to_string());
+                let _ = AppendMenuW(counts, MF_STRING | check(cfg.count == n), ID_COUNT + n, &label);
+            }
             let pause = if cfg.paused { w!("Resume") } else { w!("Pause") };
             let _ = AppendMenuW(m, MF_STRING, ID_PAUSE, pause);
+            let _ = AppendMenuW(m, MF_STRING | MF_POPUP, counts.0 as usize, w!("Clawds"));
             let _ = AppendMenuW(m, MF_STRING | MF_POPUP, scales.0 as usize, w!("Scale"));
             let _ = AppendMenuW(
                 m,
@@ -141,6 +150,7 @@ impl Tray {
                 ID_FULLSCREEN => Some(Command::ToggleFullscreen),
                 ID_STARTUP => Some(Command::ToggleStartup),
                 ID_QUIT => Some(Command::Quit),
+                n if n > ID_COUNT => Some(Command::Count(n - ID_COUNT)),
                 n if n > ID_SCALE => Some(Command::Scale((n - ID_SCALE) as i32)),
                 _ => None,
             }

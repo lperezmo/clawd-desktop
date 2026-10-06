@@ -13,6 +13,8 @@ pub struct Config {
     pub scale: i32,
     pub paused: bool,
     pub hide_fullscreen: bool,
+    /// How many Clawds walk at once, 1 to 5.
+    pub count: usize,
 }
 
 impl Default for Config {
@@ -21,6 +23,7 @@ impl Default for Config {
             scale: 4,
             paused: false,
             hide_fullscreen: true,
+            count: 1,
         }
     }
 }
@@ -47,6 +50,7 @@ impl Config {
         match toml::from_str::<Config>(&text) {
             Ok(mut c) => {
                 c.scale = c.scale.clamp(1, 12);
+                c.count = c.count.clamp(1, crate::crowd::MAX_COUNT);
                 c
             }
             Err(e) => {
@@ -78,6 +82,7 @@ mod tests {
             scale: 6,
             paused: true,
             hide_fullscreen: false,
+            count: 4,
         };
         let s = toml::to_string(&c).unwrap();
         assert_eq!(toml::from_str::<Config>(&s).unwrap(), c);
@@ -89,5 +94,12 @@ mod tests {
                 ..Config::default()
             }
         );
+        assert_eq!(partial.count, 1);
+        let three: Config = toml::from_str(
+            "count = 3
+paused = true",
+        )
+        .unwrap();
+        assert_eq!((three.count, three.paused, three.scale), (3, true, 4));
     }
 }

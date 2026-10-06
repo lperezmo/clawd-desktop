@@ -4,6 +4,7 @@
 
 mod actor;
 mod config;
+mod crowd;
 mod install;
 mod overlay;
 mod sprites;
@@ -12,8 +13,9 @@ mod sprites_data;
 mod surfaces;
 mod tray;
 
-use actor::{Actor, Pose, Rng, World};
+use actor::{Pose, Rng, World};
 use config::Config;
+use crowd::Crowd;
 use log::{debug, info, warn};
 use overlay::Overlay;
 use sprites::{FPS, frame, max_size, sheet_index};
@@ -214,18 +216,24 @@ fn idle_secs() -> f32 {
     }
 }
 
+/// One Clawd's overlays (one per monitor) and his last rendered frame.
+#[derive(Default)]
+struct View {
+    overlays: Vec<Overlay>,
+    buf: Vec<u32>,
+    buf_key: Option<u64>,
+}
+
 struct App {
     cfg: Config,
     scale: i32,
     monitors: Vec<MonitorInfo>,
-    overlays: Vec<Overlay>,
     surfaces: Vec<Surface>,
-    actor: Actor,
-    rng: Rng,
+    crowd: Crowd,
+    views: Vec<View>,
+    seeds: Rng,
     fullscreen: bool,
     hidden: bool,
-    buf: Vec<u32>,
-    buf_key: Option<u64>,
     last_rebuild: Instant,
     frames_drawn: u64,
     steps: u64,
@@ -237,16 +245,34 @@ impl App {
         SHEETS_WALK_H * self.scale
     }
 
-    fn rebuild_overlays(&mut self) {
-        self.overlays.clear();
-        self.monitors = surfaces::scan::monitors();
+    fn new_view(&self) -> View {
         let (mw, mh) = max_size();
         let (cw, ch) = (mw as i32 * self.scale, mh as i32 * self.scale);
-        for m in &self.monitors {
-            if let Some(o) = Overlay::new(m.rect, cw, ch) {
-                self.overlays.push(o);
-            }
+        View {
+            overlays: self
+                .monitors
+                .iter()
+                .filter_map(|m| Overlay::new(m.rect, cw, ch))
+                .collect(),
+            ..View::default()
         }
+    }
+
+    /// One view per Clawd: drops views of removed Clawds, adds new ones.
+    fn sync_views(&mut self) {
+        self.views.truncate(self.crowd.len());
+        while self.views.len() < self.crowd.len() {
+            let v = self.new_view();
+            self.views.push(v);
+        }
+    }
+
+    fn rebuild_overlays(&mut self) {
+        self.views.clear();
+        self.monitors = surfaces::scan::monitors();
+        self.sync_views();
+        let (mw, mh) = max_size();
+        let (cw, ch) = (mw as i32 * self.scale, mh as i32 * self.scale);
         for (i, m) in self.monitors.iter().enumerate() {
             info!(
                 "monitor {i}: {}x{} at ({}, {}), work bottom {}{}",
@@ -259,13 +285,42 @@ impl App {
             );
         }
         info!(
-            "{} overlays, {}x{} px each at scale {}",
-            self.overlays.len(),
-            cw,
-            ch,
-            self.scale
+            "overlays up to {}x{} px at scale {}, one per Clawd per monitor",
+            cw, ch, self.scale
         );
-        self.buf_key = None;
+    }
+
+    /// Where a Clawd drops in when there is no surface to put him on: the
+    /// top of the primary monitor.
+    fn fallback_start(&mut self) -> (i32, i32) {
+        let m = self
+            .monitors
+            .iter()
+            .find(|m| m.primary)
+            .or(self.monitors.first())
+            .copied();
+        let Some(m) = m else { return (0, 0) };
+        let margin = 40 * self.scale;
+        let lo = m.work.left + margin;
+        let hi = (m.work.right - margin).max(lo + 1);
+        let x = self.seeds.range(lo as f32, hi as f32) as i32;
+        (x, m.rect.top + SHEETS_WALK_H * self.scale)
+    }
+
+    fn set_count(&mut self, n: usize) {
+        let fallback = self.fallback_start();
+        let had = self.crowd.len();
+        self.crowd.resize(n, &self.surfaces, &mut self.seeds, fallback);
+        self.sync_views();
+        for (i, m) in self.crowd.members.iter().enumerate().skip(had) {
+            info!(
+                "Clawd {i} starts at ({}, {}), pace {:.2}",
+                m.actor.x, m.actor.y, m.actor.speed_mul
+            );
+        }
+        if self.crowd.len() != had {
+            info!("{} Clawd(s)", self.crowd.len());
+        }
     }
 
     fn rebuild_surfaces(&mut self) {
@@ -299,19 +354,35 @@ impl App {
         }
     }
 
+    /// "walk at (x, y), act snooze at (x, y), ..." for the log.
+    fn describe(&self) -> String {
+        self.crowd
+            .members
+            .iter()
+            .map(|m| {
+                let p = m.actor.pose();
+                format!("{} at ({}, {})", m.actor.describe(), p.x, p.y)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn should_hide(&self) -> bool {
         self.cfg.paused || (self.cfg.hide_fullscreen && self.fullscreen)
     }
 
     fn hide_all(&mut self) {
-        for o in &mut self.overlays {
-            o.hide();
+        for v in &mut self.views {
+            for o in &mut v.overlays {
+                o.hide();
+            }
         }
     }
 
-    fn render(&mut self, pose: Pose) {
-        let f = frame(pose.sprite, pose.frame);
+    fn render(&mut self, i: usize, pose: Pose) {
         let s = self.scale;
+        let v = &mut self.views[i];
+        let f = frame(pose.sprite, pose.frame);
         let key = {
             let id = match pose.sprite {
                 sprites::SpriteRef::Sheet(i) => i as u64,
@@ -319,15 +390,15 @@ impl App {
             };
             (id << 32) ^ ((pose.frame as u64) << 8) ^ ((pose.mirrored as u64) << 7) ^ (s as u64)
         };
-        if self.buf_key != Some(key) {
-            f.render(s as usize, pose.mirrored, &mut self.buf);
-            self.buf_key = Some(key);
+        if v.buf_key != Some(key) {
+            f.render(s as usize, pose.mirrored, &mut v.buf);
+            v.buf_key = Some(key);
         }
         let (sw, sh) = (f.w as i32 * s, f.h as i32 * s);
         let pos = (f.left(pose.x, s, pose.mirrored), pose.y - sh);
         let mut drew = false;
-        for o in &mut self.overlays {
-            drew |= o.show(&self.buf, sw, sh, pos, key);
+        for o in &mut v.overlays {
+            drew |= o.show(&v.buf, sw, sh, pos, key);
         }
         if drew {
             self.frames_drawn += 1;
@@ -336,7 +407,7 @@ impl App {
 
     fn set_scale(&mut self, s: i32) {
         self.scale = s;
-        self.actor.scale = s;
+        self.crowd.set_scale(s);
         self.rebuild_overlays();
         self.rebuild_surfaces();
     }
@@ -353,6 +424,10 @@ impl App {
             Command::Scale(s) => {
                 self.cfg.scale = s;
                 self.set_scale(s);
+            }
+            Command::Count(n) => {
+                self.cfg.count = n;
+                self.set_count(n);
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
             Command::ToggleStartup => {
@@ -494,22 +569,20 @@ fn run(args: &Args) -> i32 {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64);
-    let mut rng = Rng::new(seed);
     let walk_h = sprites::SHEETS[sheet_index("walk")].h as i32;
     debug_assert_eq!(walk_h, SHEETS_WALK_H);
+    let count = cfg.count;
 
     let mut app = App {
         cfg,
         scale,
         monitors: Vec::new(),
-        overlays: Vec::new(),
         surfaces: Vec::new(),
-        actor: Actor::new(0, 0, scale, &mut rng),
-        rng,
+        crowd: Crowd::new(scale),
+        views: Vec::new(),
+        seeds: Rng::new(seed),
         fullscreen: false,
         hidden: false,
-        buf: Vec::new(),
-        buf_key: None,
         last_rebuild: Instant::now(),
         frames_drawn: 0,
         steps: 0,
@@ -517,22 +590,7 @@ fn run(args: &Args) -> i32 {
     };
     app.rebuild_overlays();
     app.rebuild_surfaces();
-
-    // Drop in from the top of the primary monitor.
-    let m = app
-        .monitors
-        .iter()
-        .find(|m| m.primary)
-        .or(app.monitors.first())
-        .copied();
-    if let Some(m) = m {
-        let margin = 40 * scale;
-        let lo = m.work.left + margin;
-        let hi = (m.work.right - margin).max(lo + 1);
-        let x = app.rng.range(lo as f32, hi as f32) as i32;
-        app.actor = Actor::new(x, m.rect.top + walk_h * scale, scale, &mut app.rng);
-        info!("Clawd starts at x {x}, falling from y {}", m.rect.top + walk_h * scale);
-    }
+    app.set_count(count);
 
     let started = Instant::now();
     let deadline = args.run_for.map(|d| started + d);
@@ -624,10 +682,12 @@ fn run(args: &Args) -> i32 {
                 surfaces: &app.surfaces,
                 idle_secs: idle_secs(),
             };
-            app.actor.step(&world, &mut app.rng);
+            app.crowd.step(&world);
             app.steps += 1;
-            let pose = app.actor.pose();
-            app.render(pose);
+            for i in 0..app.crowd.len() {
+                let pose = app.crowd.members[i].actor.pose();
+                app.render(i, pose);
+            }
             next_step += STEP;
             if next_step < now {
                 next_step = now + STEP;
@@ -636,12 +696,9 @@ fn run(args: &Args) -> i32 {
 
         if now >= next_status {
             next_status = now + STATUS_EVERY;
-            let p = app.actor.pose();
             info!(
-                "status: {} at ({}, {}), {} surfaces, {} steps, {} frames drawn, {} rebuilds{}",
-                app.actor.describe(),
-                p.x,
-                p.y,
+                "status: {}; {} surfaces, {} steps, {} frames drawn, {} rebuilds{}",
+                app.describe(),
                 app.surfaces.len(),
                 app.steps,
                 app.frames_drawn,
@@ -652,13 +709,11 @@ fn run(args: &Args) -> i32 {
     }
 
     info!(
-        "exiting: {} steps, {} frames drawn, {} surface rebuilds, last pose {} at ({}, {})",
+        "exiting: {} steps, {} frames drawn, {} surface rebuilds; {}",
         app.steps,
         app.frames_drawn,
         app.rebuilds,
-        app.actor.describe(),
-        app.actor.pose().x,
-        app.actor.pose().y
+        app.describe()
     );
     app.cfg.save();
     for h in hooks {
