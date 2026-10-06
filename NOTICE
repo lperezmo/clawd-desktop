@@ -1,0 +1,8 @@
+clawd-desktop
+Copyright (c) 2026 Luis Perez Morales
+
+Clawd
+  Clawd, his name and his sprites (src/sprites_data.rs) are Anthropic's,
+  taken from https://claude.dev by way of clawd-buddy's hooks/sprites.ts.
+  They are not covered by this repository's license. tools/gen-sprites.ts
+  rebuilds src/sprites_data.rs from that file.
