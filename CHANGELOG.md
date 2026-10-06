@@ -1,6 +1,23 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-10-06)
+
+### Features
+
+- Crowd antics: conversations, laptop pairs, shoves, stacks, moods
+  ([#2](https://github.com/lperezmo/clawd-desktop/pull/2),
+  [`f421157`](https://github.com/lperezmo/clawd-desktop/commit/f421157bd2a920f4ab9681c64bcc83024fb952a6))
+
+Two Clawds that meet now stop and face each other for a beat before one turns, sometimes ride on
+  each other (never three high), rarely shove (the other hops over and lands behind with a startled
+  ?!), and sit down to work side by side with laptops while Claude Code is locked in or when one
+  walks up to another at his laptop. Each comes away happy or annoyed, which leans his next act.
+  Everything one Clawd does because of another is over within about three seconds, apart from the
+  laptop acts, which are ordinary acts. The encounter state machine lives in crowd.rs and is unit
+  tested. New tray toggle Crowd antics (crowd_antics in config.toml).
+
+
 ## v0.2.0 (2026-10-06)
 
 ### Chores
