@@ -16,13 +16,17 @@
 //! - Afterwards each feels something (happy after company, annoyed after a
 //!   shove) that leans his next act.
 //!
+//! - Zero g: when one starts the space act, gravity turns off for him and
+//!   whoever stands within a body width of him floats along for a moment.
+//!   A rider gets down first; nobody stacks in zero g.
+//!
 //! Nothing that happens because of another Clawd lasts longer than
 //! `ENCOUNTER_CAP` frames, apart from the laptop acts, which are ordinary
 //! acts with their ordinary length.
 
-use crate::actor::{Actor, Feel, HALF_BODY, HEAD, Landing, PERCH_FRAMES, Rng, STARTLE_FRAMES, World};
+use crate::actor::{Actor, Feel, HALF_BODY, HEAD, Landing, PASSENGER_FRAMES, PERCH_FRAMES, Rng, STARTLE_FRAMES, World};
 use crate::sprites::{FPS, SHEETS, act_index, sheet_index};
-use crate::surfaces::Surface;
+use crate::surfaces::{Rect, Surface};
 
 pub const MAX_COUNT: usize = 5;
 
@@ -460,7 +464,8 @@ impl Crowd {
     /// Riding, carrying, still calming down after a meeting, or busy with
     /// another Clawd: only the plain rule applies to him.
     fn busy(&self, i: usize) -> bool {
-        self.in_stack(i) || self.calm[i] > 0 || self.members[i].actor.is_social()
+        let a = &self.members[i].actor;
+        self.in_stack(i) || self.calm[i] > 0 || a.is_social() || a.is_floating()
     }
 
     fn in_stack(&self, i: usize) -> bool {
@@ -612,6 +617,49 @@ impl Crowd {
             self.calm[j] = calm;
         }
         p != Plan::Pass
+    }
+
+    /// Who wants the space act now that an act came due; each wish is
+    /// cleared. The app grants them with `float`, which needs the work areas.
+    pub fn space_wishes(&mut self) -> Vec<usize> {
+        (0..self.members.len())
+            .filter(|&i| self.members[i].actor.take_space_wish())
+            .collect()
+    }
+
+    /// Clawd `i` plays the space act with gravity off, inside his work area
+    /// (one of `areas`). A rider on his head gets down first, he floats off
+    /// the head he is riding on, and with antics on anyone standing within a
+    /// body width of him floats along for a moment (well under three
+    /// seconds) and drops. False when he cannot float now.
+    pub fn float(&mut self, i: usize, areas: &[Rect]) -> bool {
+        let Some(m) = self.members.get_mut(i) else { return false };
+        let (x, y) = (m.actor.x, m.actor.y.round());
+        if !m.actor.float(areas, &mut m.rng) {
+            return false;
+        }
+        // No stacks in zero g: his rider hops down in front, and the one he
+        // was riding walks on.
+        self.tend_stacks();
+        if !self.antics {
+            return true;
+        }
+        let reach = SHEETS[sheet_index("walk")].w as f32 * self.scale as f32;
+        for j in 0..self.members.len() {
+            if j == i || self.busy(j) {
+                continue;
+            }
+            let a = &self.members[j].actor;
+            let afoot = a.is_walking() || a.act_name().is_some();
+            if !afoot || a.y.round() != y || (a.x - x).abs() >= reach {
+                continue;
+            }
+            let m = &mut self.members[j];
+            if m.actor.float_along(areas, &mut m.rng) {
+                self.calm[j] = ((PASSENGER_FRAMES as f32 / FPS as f32 + CALM) * FPS as f32) as u32;
+            }
+        }
+        true
     }
 
     /// Keeps each rider on his carrier's head while the carrier walks, and
@@ -1362,5 +1410,79 @@ mod tests {
         }
         assert!(shoves > 0, "{seen_plans:?}");
         assert!(shoves * 5 < head_on, "shoves are rare: {shoves} of {head_on}");
+    }
+
+    // ---- zero g ----
+
+    fn area() -> Rect {
+        mon().work
+    }
+
+    #[test]
+    fn nobody_stacks_in_zero_g() {
+        let s = ground();
+        // The carrier floats: his rider hops down first.
+        let mut c = walkers(&s, &[(1000.0, 1.0), (960.0, 1.0)]);
+        c.apply(0, 1, Plan::Climb { climber: 1 });
+        for _ in 0..CLIMB_HOP.0 + 2 {
+            c.step(&world(&s));
+        }
+        assert!(c.members[1].actor.perch_left().is_some());
+        assert!(c.float(0, &[area()]));
+        assert!(c.stacks().is_empty());
+        assert_eq!(c.members[1].actor.describe(), "leap");
+        assert!(!c.members[1].actor.is_floating(), "the rider gets down, not up");
+        for _ in 0..ENCOUNTER_CAP {
+            c.step(&world(&s));
+            assert!(c.stacks().is_empty());
+        }
+        assert!(c.members[1].actor.is_walking(), "{}", c.members[1].actor.describe());
+        assert_eq!(c.members[1].actor.pose().y, 1032);
+        assert!(c.members[0].actor.is_floating());
+
+        // The rider floats: off the head he was on.
+        let mut c = walkers(&s, &[(1000.0, 1.0), (960.0, 1.0)]);
+        c.apply(0, 1, Plan::Climb { climber: 1 });
+        for _ in 0..CLIMB_HOP.0 + 2 {
+            c.step(&world(&s));
+        }
+        let head = c.members[1].actor.pose().y;
+        assert!(c.float(1, &[area()]));
+        assert!(c.stacks().is_empty());
+        assert_eq!(c.members[1].actor.pose().y, head, "lifts off from where he was");
+        assert!(
+            !c.members[0].actor.is_floating(),
+            "the carrier is not his neighbour any more"
+        );
+        while c.members[1].actor.is_floating() {
+            c.step(&world(&s));
+            assert!(c.stacks().is_empty());
+        }
+    }
+
+    #[test]
+    fn one_beside_him_floats_along_for_under_three_seconds() {
+        let s = ground();
+        let mut c = walkers(&s, &[(1000.0, 1.0), (1060.0, -1.0), (1400.0, 1.0)]);
+        assert!(c.float(0, &[area()]));
+        assert_eq!(c.members[1].actor.describe(), "float along");
+        assert!(!c.members[2].actor.is_floating(), "too far away");
+        let mut frames = 0;
+        let mut rose = false;
+        while !c.members[1].actor.is_walking() {
+            c.step(&world(&s));
+            frames += 1;
+            rose |= c.members[1].actor.pose().y < 1032 - 4 * S;
+            assert!(frames <= ENCOUNTER_CAP, "still up after {frames} frames");
+        }
+        assert!(rose);
+        assert_eq!(c.members[1].actor.pose().y, 1032);
+        assert!(c.members[0].actor.is_floating(), "the one in the suit is still up");
+
+        // Antics off: only he floats.
+        let mut c = walkers(&s, &[(1000.0, 1.0), (1060.0, -1.0)]);
+        c.antics = false;
+        assert!(c.float(0, &[area()]));
+        assert!(!c.members[1].actor.is_floating());
     }
 }
