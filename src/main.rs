@@ -4,6 +4,7 @@
 
 mod actor;
 mod config;
+mod install;
 mod overlay;
 mod sprites;
 #[rustfmt::skip]
@@ -107,7 +108,15 @@ unsafe extern "system" fn win_event(
     DIRTY.set(true);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Run,
+    Install,
+    Uninstall,
+}
+
 struct Args {
+    action: Action,
     scale: Option<i32>,
     console: bool,
     run_for: Option<Duration>,
@@ -115,6 +124,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
+        action: Action::Run,
         scale: None,
         console: false,
         run_for: None,
@@ -124,6 +134,8 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--scale" => a.scale = it.next().and_then(|v| v.parse().ok()).map(|s: i32| s.clamp(1, 12)),
             "--console" => a.console = true,
+            "--install" => a.action = Action::Install,
+            "--uninstall" => a.action = Action::Uninstall,
             "--run-for" => {
                 a.run_for = it
                     .next()
@@ -344,7 +356,7 @@ impl App {
             }
             Command::ToggleFullscreen => self.cfg.hide_fullscreen = !self.cfg.hide_fullscreen,
             Command::ToggleStartup => {
-                if let Err(e) = tray::set_startup(!tray::startup_enabled()) {
+                if let Err(e) = install::set_startup(!install::startup_enabled()) {
                     warn!("start with Windows: {e}");
                 }
             }
@@ -357,8 +369,35 @@ impl App {
 
 const SHEETS_WALK_H: i32 = 18;
 
+/// `--install` and `--uninstall`: report to the parent console, if any.
+fn install_action(action: Action) -> i32 {
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+    let r = if action == Action::Install {
+        install::install()
+    } else {
+        install::uninstall()
+    };
+    match r {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
 fn main() {
     let args = parse_args();
+    if args.action != Action::Run {
+        std::process::exit(install_action(args.action));
+    }
     init_logging(args.console);
 
     unsafe {

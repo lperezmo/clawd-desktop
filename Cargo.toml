@@ -5,12 +5,20 @@ edition = "2024"
 description = "Clawd walks along the edges of your windows and the taskbar."
 license = "MIT"
 publish = false
+build = "build.rs"
 
 [dependencies]
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+[build-dependencies]
+winresource = "0.1"
+
+[[example]]
+name = "make-icon"
+path = "tools/make-icon.rs"
 
 [dependencies.windows]
 version = "0.62"

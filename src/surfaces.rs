@@ -166,13 +166,14 @@ pub fn build(windows: &[WindowInfo], monitors: &[MonitorInfo], headroom: i32) ->
 
     let mut out: Vec<Surface> = Vec::new();
     for (y, part, ground) in segs {
-        if let Some(last) = out.last_mut() {
-            if last.y == y && part.x0 <= last.x1 + MERGE_GAP {
-                last.x1 = last.x1.max(part.x1);
-                last.ground |= ground;
-                last.parts.push(part);
-                continue;
-            }
+        if let Some(last) = out.last_mut()
+            && last.y == y
+            && part.x0 <= last.x1 + MERGE_GAP
+        {
+            last.x1 = last.x1.max(part.x1);
+            last.ground |= ground;
+            last.parts.push(part);
+            continue;
         }
         out.push(Surface {
             y,

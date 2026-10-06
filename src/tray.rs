@@ -1,24 +1,20 @@
-//! Tray icon, its menu, and the Start with Windows shortcut.
+//! Tray icon and its menu.
 
 use crate::config::{Config, SCALES};
-use crate::sprites::{SpriteRef, frame, sheet_index};
+use crate::install::startup_enabled;
 use log::warn;
-use std::path::PathBuf;
 use windows::Win32::Foundation::{HWND, POINT};
-use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject,
-};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Startup, IShellLinkW, KNOWN_FOLDER_FLAG, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW, SHGetKnownFolderPath, Shell_NotifyIconW, ShellLink,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, ICONINFO,
-    MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow, TPM_BOTTOMALIGN,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetSystemMetrics, HICON, IMAGE_ICON,
+    LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW,
+    SM_CXSMICON, SM_CYSMICON, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_APP, WM_NULL,
 };
-use windows::core::{HSTRING, Interface, PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 pub const WM_TRAY: u32 = WM_APP + 1;
 
@@ -42,46 +38,22 @@ pub struct Tray {
     icon: HICON,
 }
 
-/// Clawd's standing frame, centred on a 32 by 32 icon.
-fn make_icon() -> Option<HICON> {
-    let f = frame(SpriteRef::Sheet(sheet_index("walk")), 0);
-    let mut px = Vec::new();
-    f.render(1, false, &mut px);
-    let (n, ox, oy) = (32usize, (32 - f.w) / 2, (32 - f.h) / 2);
+/// MAKEINTRESOURCE(1): icon group 1 in build.rs.
+#[allow(clippy::manual_dangling_ptr)]
+const ICON_ID: PCWSTR = PCWSTR(1 as *const u16);
+
+/// Clawd's icon from the exe's resources (icon group 1, see build.rs), at
+/// the small icon size.
+fn load_icon() -> HICON {
     unsafe {
-        let bi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: n as i32,
-                biHeight: -(n as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
-        let color = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
-        let dib = core::slice::from_raw_parts_mut(bits as *mut u32, n * n);
-        dib.fill(0);
-        for y in 0..f.h {
-            for x in 0..f.w {
-                dib[(y + oy) * n + x + ox] = px[y * f.w + x];
-            }
-        }
-        let mask = CreateBitmap(n as i32, n as i32, 1, 1, None);
-        let info = ICONINFO {
-            fIcon: true.into(),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: color,
-        };
-        let icon = CreateIconIndirect(&info).ok();
-        let _ = DeleteObject(color.into());
-        let _ = DeleteObject(mask.into());
-        icon
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        let (cx, cy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        LoadImageW(Some(hinst.into()), ICON_ID, IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR)
+            .map(|h| HICON(h.0))
+            .unwrap_or_else(|e| {
+                warn!("tray icon: {e}");
+                HICON::default()
+            })
     }
 }
 
@@ -98,7 +70,7 @@ impl Tray {
     pub fn new(hwnd: HWND) -> Tray {
         let t = Tray {
             hwnd,
-            icon: make_icon().unwrap_or_default(),
+            icon: load_icon(),
         };
         t.add();
         t
@@ -185,44 +157,4 @@ impl Drop for Tray {
             }
         }
     }
-}
-
-fn shortcut_path() -> Option<PathBuf> {
-    unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_Startup, KNOWN_FOLDER_FLAG(0), None).ok()?;
-        let s = p.to_string().ok();
-        CoTaskMemFree(Some(p.0 as *const _));
-        Some(PathBuf::from(s?).join("Clawd Desktop.lnk"))
-    }
-}
-
-pub fn startup_enabled() -> bool {
-    shortcut_path().is_some_and(|p| p.exists())
-}
-
-/// Adds or removes the Startup folder shortcut.
-pub fn set_startup(on: bool) -> Result<(), String> {
-    let Some(path) = shortcut_path() else {
-        return Err("no Startup folder".into());
-    };
-    if !on {
-        let _ = std::fs::remove_file(&path);
-        return Ok(());
-    }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    make_link(&exe, &path).map_err(|e| e.to_string())
-}
-
-fn make_link(exe: &std::path::Path, path: &std::path::Path) -> windows::core::Result<()> {
-    unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
-        link.SetPath(&HSTRING::from(exe.as_os_str()))?;
-        if let Some(dir) = exe.parent() {
-            link.SetWorkingDirectory(&HSTRING::from(dir.as_os_str()))?;
-        }
-        link.SetDescription(w!("Clawd walks along your windows"))?;
-        let pf: IPersistFile = link.cast()?;
-        pf.Save(&HSTRING::from(path.as_os_str()), true)?;
-    }
-    Ok(())
 }
