@@ -283,7 +283,7 @@ pub mod scan {
         matches!(c, "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
     }
 
-    fn cloaked(h: HWND) -> bool {
+    pub fn cloaked(h: HWND) -> bool {
         let mut v: u32 = 0;
         unsafe {
             DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut v as *mut _ as *mut _, size_of::<u32>() as u32).is_ok()

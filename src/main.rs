@@ -6,19 +6,22 @@ mod actor;
 mod config;
 mod crowd;
 mod install;
+mod leans;
 mod overlay;
+mod react;
+mod signals;
 mod sprites;
 #[rustfmt::skip]
 mod sprites_data;
 mod surfaces;
 mod tray;
 
-use actor::{Pose, Rng, World};
+use actor::{Pose, Rng, Trigger, World};
 use config::Config;
 use crowd::Crowd;
 use log::{debug, info, warn};
 use overlay::Overlay;
-use sprites::{FPS, frame, max_size, sheet_index};
+use sprites::{ACTS, FPS, act_index, frame, max_size, sheet_index};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -35,12 +38,13 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_DESTROY,
-    EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT, GetAncestor, MSG, MWMO_INPUTAVAILABLE,
-    MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
-    RegisterWindowMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_OBJECT_CLOAKED,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GA_ROOT,
+    GetAncestor, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, OBJID_WINDOW, PM_REMOVE, PeekMessageW,
+    QS_ALLINPUT, RegisterClassW, RegisterWindowMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_QUIT,
+    WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::w;
 
@@ -48,12 +52,25 @@ const STEP: Duration = Duration::from_nanos(1_000_000_000 / FPS as u64);
 const POLL: Duration = Duration::from_millis(500);
 const MIN_REBUILD: Duration = Duration::from_millis(100);
 const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// How often the clock and the battery are read for the leans.
+const SIGNALS_EVERY: Duration = Duration::from_secs(60);
+/// Rest between foreground-change reactions, over all Clawds.
+const FOREGROUND_REST: Duration = Duration::from_secs(8);
+/// How long a create or show waits for its other half, and how many wait.
+const PAIR_MS: u32 = 5000;
+const MAX_RECENT: usize = 512;
+/// A foreground change reacts this much later, so the new window that
+/// caused it reacts first.
+const FOREGROUND_DELAY: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     TrayMenu,
     DisplayChange,
     TaskbarCreated,
+    /// A top-level window was created and then shown.
+    NewWindow(isize),
+    Foreground(isize),
     Quit,
 }
 
@@ -61,6 +78,36 @@ thread_local! {
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
     static DIRTY: Cell<bool> = const { Cell::new(false) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+    static RECENT: RefCell<Vec<(isize, Seen, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Created,
+    Shown,
+}
+
+/// Notes that `h` was created or shown. True when the other half arrived
+/// within `PAIR_MS`: a new top-level window. The two can come in either
+/// order (Explorer's create event lands after its show).
+fn pair(h: isize, seen: Seen) -> bool {
+    let now = unsafe { GetTickCount() };
+    RECENT.with(|r| {
+        let mut r = r.borrow_mut();
+        r.retain(|&(_, _, t)| now.wrapping_sub(t) < PAIR_MS);
+        if let Some(i) = r.iter().position(|&(x, s, _)| x == h && s != seen) {
+            r.swap_remove(i);
+            return true;
+        }
+        if seen == Seen::Shown && r.iter().any(|&(x, s, _)| x == h && s == seen) {
+            return false;
+        }
+        if r.len() >= MAX_RECENT {
+            r.remove(0);
+        }
+        r.push((h, seen, now));
+        false
+    })
 }
 
 fn push(e: Event) {
@@ -104,8 +151,29 @@ unsafe extern "system" fn win_event(
     if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 || hwnd.0.is_null() {
         return;
     }
-    if event == EVENT_OBJECT_LOCATIONCHANGE && unsafe { GetAncestor(hwnd, GA_ROOT) } != hwnd {
-        return;
+    let top = || unsafe { GetAncestor(hwnd, GA_ROOT) } == hwnd;
+    match event {
+        EVENT_OBJECT_LOCATIONCHANGE if !top() => return,
+        EVENT_OBJECT_CREATE => {
+            if top() && pair(hwnd.0 as isize, Seen::Created) {
+                push(Event::NewWindow(hwnd.0 as isize));
+            }
+            return;
+        }
+        // Shown, or uncloaked: Explorer and other DWM-cloaked windows show
+        // up cloaked and appear when uncloaked.
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
+            let h = hwnd.0 as isize;
+            if surfaces::scan::cloaked(hwnd) {
+                DIRTY.set(true);
+                return;
+            }
+            if pair(h, Seen::Shown) {
+                push(Event::NewWindow(h));
+            }
+        }
+        EVENT_SYSTEM_FOREGROUND => push(Event::Foreground(hwnd.0 as isize)),
+        _ => {}
     }
     DIRTY.set(true);
 }
@@ -234,6 +302,12 @@ struct App {
     seeds: Rng,
     fullscreen: bool,
     hidden: bool,
+    /// What the leans are worked out from, and the leans themselves.
+    context: leans::Context,
+    leans: Vec<f32>,
+    last_foreground_react: Option<Instant>,
+    /// A foreground change waiting for `FOREGROUND_DELAY`.
+    pending_foreground: Option<Instant>,
     last_rebuild: Instant,
     frames_drawn: u64,
     steps: u64,
@@ -405,6 +479,75 @@ impl App {
         }
     }
 
+    /// Re-reads the clock, battery and media state; recomputes the leans
+    /// when any changed. `full` also reads the clock and battery.
+    fn refresh_leans(&mut self, full: bool) {
+        let mut ctx = self.context;
+        if full {
+            ctx.hour = signals::local_hour();
+            ctx.low_battery = signals::low_battery();
+        }
+        ctx.media = signals::media_playing();
+        if ctx != self.context || self.leans.is_empty() {
+            self.context = ctx;
+            self.leans = leans::leans(&ctx);
+            info!("leaning toward {:?}", leans::reasons(&ctx));
+        }
+    }
+
+    /// A new top-level window: a terminal, browser or Explorer window makes
+    /// the nearest Clawd that is free react.
+    fn new_window(&mut self, h: isize) {
+        let Some((exe, class, rect)) = react::win::describe(HWND(h as *mut _)) else {
+            return;
+        };
+        let Some(kind) = react::classify(&exe, &class) else {
+            debug!("new window {class} of {exe}: no reaction");
+            return;
+        };
+        let at = ((rect.left + rect.right) / 2, rect.top);
+        let points: Vec<(i32, i32)> = self
+            .crowd
+            .members
+            .iter()
+            .map(|m| (m.actor.x as i32, m.actor.y as i32))
+            .collect();
+        for i in react::nearest_first(&points, at) {
+            let m = &mut self.crowd.members[i];
+            let acts = react::acts_for(kind);
+            let act = act_index(acts[(m.rng.next_u64() % acts.len() as u64) as usize]);
+            if m.actor.react(act, Trigger::Desktop, false) {
+                info!("new {kind:?} window ({class}): Clawd {i} plays {}", ACTS[act].name);
+                // The foreground change it caused is this reaction.
+                self.pending_foreground = None;
+                return;
+            }
+        }
+        debug!("new {kind:?} window: every Clawd is busy");
+    }
+
+    /// The foreground window changed: one free Clawd turns or looks around.
+    fn foreground(&mut self, now: Instant) {
+        if self.last_foreground_react.is_some_and(|t| now - t < FOREGROUND_REST) {
+            return;
+        }
+        let n = self.crowd.len();
+        if n == 0 {
+            return;
+        }
+        let start = (self.seeds.next_u64() % n as u64) as usize;
+        for k in 0..n {
+            let i = (start + k) % n;
+            let m = &mut self.crowd.members[i];
+            let name = react::FOREGROUND_ACTS[(m.rng.next_u64() % 2) as usize];
+            if m.actor.react(act_index(name), Trigger::Desktop, false) {
+                debug!("foreground change: Clawd {i} plays {name}");
+                self.last_foreground_react = Some(now);
+                return;
+            }
+        }
+    }
+
     fn set_scale(&mut self, s: i32) {
         self.scale = s;
         self.crowd.set_scale(s);
@@ -538,7 +681,8 @@ fn run(args: &Args) -> i32 {
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
-        (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
+        (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
     ]
     .iter()
@@ -583,6 +727,10 @@ fn run(args: &Args) -> i32 {
         seeds: Rng::new(seed),
         fullscreen: false,
         hidden: false,
+        context: leans::Context::default(),
+        leans: Vec::new(),
+        last_foreground_react: None,
+        pending_foreground: None,
         last_rebuild: Instant::now(),
         frames_drawn: 0,
         steps: 0,
@@ -591,11 +739,14 @@ fn run(args: &Args) -> i32 {
     app.rebuild_overlays();
     app.rebuild_surfaces();
     app.set_count(count);
+    signals::start_media_watch();
+    app.refresh_leans(true);
 
     let started = Instant::now();
     let deadline = args.run_for.map(|d| started + d);
     let mut next_step = Instant::now();
     let mut next_status = started + STATUS_EVERY;
+    let mut next_signals = started + SIGNALS_EVERY;
     let mut running = true;
 
     while running {
@@ -644,6 +795,11 @@ fn run(args: &Args) -> i32 {
                     app.rebuild_overlays();
                     app.rebuild_surfaces();
                 }
+                Event::NewWindow(h) if !app.hidden && !app.cfg.paused => app.new_window(h),
+                Event::Foreground(_) if !app.hidden && !app.cfg.paused => {
+                    app.pending_foreground = Some(Instant::now() + FOREGROUND_DELAY)
+                }
+                Event::NewWindow(_) | Event::Foreground(_) => {}
                 Event::TrayMenu => {
                     if let Some(cmd) = tray.menu(&app.cfg) {
                         running &= app.handle(cmd);
@@ -681,6 +837,7 @@ fn run(args: &Args) -> i32 {
             let world = World {
                 surfaces: &app.surfaces,
                 idle_secs: idle_secs(),
+                leans: &app.leans,
             };
             app.crowd.step(&world);
             app.steps += 1;
@@ -692,6 +849,18 @@ fn run(args: &Args) -> i32 {
             if next_step < now {
                 next_step = now + STEP;
             }
+        }
+
+        if app.pending_foreground.is_some_and(|t| now >= t) {
+            app.pending_foreground = None;
+            app.foreground(now);
+        }
+
+        if now >= next_signals {
+            next_signals = now + SIGNALS_EVERY;
+            app.refresh_leans(true);
+        } else if !hide && app.steps.is_multiple_of(FPS as u64) {
+            app.refresh_leans(false);
         }
 
         if now >= next_status {

@@ -72,6 +72,9 @@ const HOP: [i32; 4] = [-2, -3, -2, -1];
 pub struct World<'a> {
     pub surfaces: &'a [Surface],
     pub idle_secs: f32,
+    /// Multipliers on the site's weights, one per act (time of day, media,
+    /// battery, Claude Code's mood). Empty for none.
+    pub leans: &'a [f32],
 }
 
 /// Why an act is playing, which decides what follows it.
@@ -83,6 +86,62 @@ pub enum ActKind {
     Chain,
     /// The user is away: loops until input comes back.
     Sleepy,
+    /// Something happened: over in about three seconds (`reaction_cap`),
+    /// then a double hop when `then_hop`.
+    Reaction { then_hop: bool },
+}
+
+/// Who asked for a reaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// The desktop: only while walking or in a timer act, one at a time,
+    /// with a short rest between.
+    Desktop,
+    /// The user (a click, Perform, Claude Code celebrating): anything but a
+    /// fall or a drag gives way.
+    User,
+}
+
+/// Frames a reaction may run: about three seconds, or ten for a work
+/// session at the laptop or desktop.
+pub const REACTION_FRAMES: usize = 3 * FPS as usize;
+pub const WORK_FRAMES: usize = 10 * FPS as usize;
+/// A capped act jumps to its last frames this long before the cap, so it
+/// still ends on the act's own way back to standing.
+const TAIL: usize = 6;
+/// Seconds after a reaction before the desktop may start another.
+pub const REACT_REST: f32 = 2.0;
+
+pub fn reaction_cap(act: usize) -> usize {
+    match ACTS[act].name {
+        "laptop" | "desktop" => WORK_FRAMES,
+        _ => REACTION_FRAMES,
+    }
+}
+
+/// The frame after `frame` when `played` frames have been shown so far, for
+/// an act of `len` frames capped at `cap`; None when it is over.
+pub fn next_act_frame(frame: usize, played: usize, len: usize, cap: usize) -> Option<usize> {
+    let played = played + 1;
+    if len <= cap {
+        return (frame + 1 < len).then_some(frame + 1);
+    }
+    if played >= cap {
+        None
+    } else if played == cap - TAIL {
+        Some(len - TAIL)
+    } else {
+        Some(frame + 1)
+    }
+}
+
+/// `weights` times `leans`, entry by entry; no leans leaves them as they are.
+pub fn leaned(weights: &[f32], leans: &[f32]) -> Vec<f32> {
+    weights
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| w * leans.get(i).copied().unwrap_or(1.0))
+        .collect()
 }
 
 /// Whether an act of `kind` that just ended is followed straight away by another.
@@ -97,6 +156,7 @@ enum Mode {
         act: usize,
         frame: usize,
         kind: ActKind,
+        played: usize,
     },
     Ride {
         sheet: usize,
@@ -110,6 +170,7 @@ enum Mode {
     },
     Hop {
         step: usize,
+        twice: bool,
     },
 }
 
@@ -140,6 +201,8 @@ pub struct Actor {
     turning: usize,
     weights: Vec<f32>,
     sleepy: Vec<f32>,
+    /// Seconds until the desktop may start a reaction.
+    rest: f32,
 }
 
 impl Actor {
@@ -159,6 +222,7 @@ impl Actor {
             turning: act_index("turning"),
             weights: act_weights(),
             sleepy: sleepy_weights(),
+            rest: 0.0,
         }
     }
 
@@ -170,6 +234,37 @@ impl Actor {
     /// Walking along a surface (not acting, riding, hopping or falling).
     pub fn is_walking(&self) -> bool {
         matches!(self.mode, Mode::Walk)
+    }
+
+    /// One of the site's acts, its weights times `leans`.
+    pub fn pick(&self, leans: &[f32], rng: &mut Rng) -> usize {
+        pick_weighted(&leaned(&self.weights, leans), rng)
+    }
+
+    /// Whether a reaction from `trigger` may start now.
+    pub fn can_react(&self, trigger: Trigger) -> bool {
+        match self.mode {
+            Mode::Fall { .. } => false,
+            _ if trigger == Trigger::User => true,
+            Mode::Walk => self.rest <= 0.0,
+            Mode::Act { kind, .. } => self.rest <= 0.0 && !matches!(kind, ActKind::Reaction { .. }),
+            _ => false,
+        }
+    }
+
+    /// Plays `act` as a reaction now, if `can_react`; then a double hop when
+    /// `then_hop`. Returns whether it started.
+    pub fn react(&mut self, act: usize, trigger: Trigger, then_hop: bool) -> bool {
+        if !self.can_react(trigger) {
+            return false;
+        }
+        self.mode = Mode::Act {
+            act,
+            frame: 0,
+            kind: ActKind::Reaction { then_hop },
+            played: 0,
+        };
+        true
     }
 
     pub fn turn_around(&mut self) {
@@ -193,7 +288,7 @@ impl Actor {
             Mode::Act { act, frame, .. } => (SpriteRef::Act(act), frame, 0),
             Mode::Ride { sheet, frame, .. } => (SpriteRef::Sheet(sheet), frame, 0),
             Mode::Fall { frame, .. } => (SpriteRef::Act(self.turning), frame, 0),
-            Mode::Hop { step } => (
+            Mode::Hop { step, .. } => (
                 SpriteRef::Sheet(self.walk),
                 0,
                 HOP[step.min(HOP.len() - 1)] * self.scale,
@@ -226,6 +321,7 @@ impl Actor {
 
     /// Advances one frame.
     pub fn step(&mut self, world: &World, rng: &mut Rng) {
+        self.rest = (self.rest - DT).max(0.0);
         let xi = self.x.round() as i32;
         let yi = self.y.round() as i32;
 
@@ -244,24 +340,51 @@ impl Actor {
 
         match self.mode {
             Mode::Walk => self.walk_step(world, s, rng),
-            Mode::Act { act, frame, kind } => {
+            Mode::Act {
+                act,
+                frame,
+                kind,
+                played,
+            } => {
                 // Back from away: finish this one and walk on.
                 let kind = if kind == ActKind::Sleepy && world.idle_secs < 1.0 {
                     ActKind::Chain
                 } else {
                     kind
                 };
-                let next = frame + 1;
-                if next < ACTS[act].frames.len() {
-                    self.mode = Mode::Act { act, frame: next, kind };
+                let len = ACTS[act].frames.len();
+                let cap = match kind {
+                    ActKind::Reaction { .. } => reaction_cap(act),
+                    _ => usize::MAX,
+                };
+                if let Some(next) = next_act_frame(frame, played, len, cap) {
+                    self.mode = Mode::Act {
+                        act,
+                        frame: next,
+                        kind,
+                        played: played + 1,
+                    };
                 } else if kind == ActKind::Sleepy {
-                    self.mode = Mode::Act { act, frame: 0, kind };
+                    self.mode = Mode::Act {
+                        act,
+                        frame: 0,
+                        kind,
+                        played: 0,
+                    };
+                } else if let ActKind::Reaction { then_hop } = kind {
+                    self.rest = REACT_REST;
+                    if then_hop {
+                        self.mode = Mode::Hop { step: 0, twice: true };
+                    } else {
+                        self.start_walk(rng);
+                    }
                 } else if chains(kind, rng) {
-                    let act = pick_weighted(&self.weights, rng);
+                    let act = self.pick(world.leans, rng);
                     self.mode = Mode::Act {
                         act,
                         frame: 0,
                         kind: ActKind::Chain,
+                        played: 0,
                     };
                 } else {
                     self.start_walk(rng);
@@ -273,9 +396,11 @@ impl Actor {
                 cruise,
                 left,
             } => self.ride_step(s, sheet, frame, cruise, left, rng),
-            Mode::Hop { step } => {
+            Mode::Hop { step, twice } => {
                 if step + 1 < HOP.len() {
-                    self.mode = Mode::Hop { step: step + 1 };
+                    self.mode = Mode::Hop { step: step + 1, twice };
+                } else if twice {
+                    self.mode = Mode::Hop { step: 0, twice: false };
                 } else {
                     self.start_walk(rng);
                 }
@@ -298,7 +423,7 @@ impl Actor {
                 if hi > lo {
                     self.x = self.x.clamp(lo, hi);
                 }
-                self.mode = Mode::Hop { step: 0 };
+                self.mode = Mode::Hop { step: 0, twice: false };
             }
             Some(_) => {
                 self.y = ny;
@@ -333,6 +458,7 @@ impl Actor {
                 act,
                 frame: 0,
                 kind: ActKind::Sleepy,
+                played: 0,
             };
             return;
         }
@@ -349,11 +475,12 @@ impl Actor {
                     left: rng.range(4.0, 10.0),
                 };
             } else {
-                let act = pick_weighted(&self.weights, rng);
+                let act = self.pick(world.leans, rng);
                 self.mode = Mode::Act {
                     act,
                     frame: 0,
                     kind: ActKind::Timer,
+                    played: 0,
                 };
             }
             return;
@@ -512,6 +639,7 @@ mod tests {
         let world = World {
             surfaces: &s,
             idle_secs: 0.0,
+            leans: &[],
         };
         let mut gaps = Vec::new();
         let mut chained = 0;
@@ -554,6 +682,128 @@ mod tests {
         assert!((0.12..0.4).contains(&share), "{chained} chains in {acts} acts");
     }
 
+    /// A Clawd standing on the ground, walking.
+    fn walker(rng: &mut Rng, s: &[Surface]) -> Actor {
+        let mut a = Actor::new(900, 1032, 4, rng);
+        let world = World {
+            surfaces: s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        a.next_act_in = 1000.0;
+        for _ in 0..12 {
+            a.step(&world, rng);
+        }
+        assert!(a.is_walking(), "{}", a.describe());
+        a
+    }
+
+    #[test]
+    fn reactions_are_one_at_a_time_and_short() {
+        let s = build(&[], &[mon()], 72);
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        let mut rng = Rng::new(2);
+        let mut a = walker(&mut rng, &s);
+        let notebook = act_index("notebook");
+        assert!(ACTS[notebook].frames.len() > REACTION_FRAMES);
+        assert!(a.react(notebook, Trigger::Desktop, false));
+        // A second desktop reaction waits for the first.
+        assert!(!a.can_react(Trigger::Desktop));
+        assert!(!a.react(act_index("coffee"), Trigger::Desktop, false));
+        let mut frames = 1;
+        while matches!(a.mode, Mode::Act { .. }) {
+            a.step(&world, &mut rng);
+            frames += 1;
+        }
+        assert_eq!(frames, REACTION_FRAMES + 1, "about three seconds, then walking");
+        assert!(a.is_walking());
+        // A short rest before the desktop may start another.
+        assert!(!a.can_react(Trigger::Desktop));
+        for _ in 0..(REACT_REST * FPS as f32) as usize + 1 {
+            a.step(&world, &mut rng);
+        }
+        assert!(a.can_react(Trigger::Desktop), "{}", a.describe());
+        // The user does not wait.
+        assert!(a.react(act_index("coffee"), Trigger::User, false));
+        assert!(a.react(act_index("dancing"), Trigger::User, false));
+        assert_eq!(a.describe(), "act dancing");
+    }
+
+    #[test]
+    fn capped_acts_end_on_their_own_last_frames() {
+        let len = 81;
+        let cap = REACTION_FRAMES;
+        let mut seq = vec![0];
+        let (mut f, mut p) = (0, 0);
+        while let Some(n) = next_act_frame(f, p, len, cap) {
+            seq.push(n);
+            f = n;
+            p += 1;
+        }
+        assert_eq!(seq.len(), cap);
+        assert_eq!(*seq.last().unwrap(), len - 1);
+        assert_eq!(seq[cap - TAIL], len - TAIL);
+        // Short acts play whole.
+        let (mut f, mut p, mut n) = (0, 0, 1);
+        while let Some(x) = next_act_frame(f, p, 20, cap) {
+            f = x;
+            p += 1;
+            n += 1;
+        }
+        assert_eq!(n, 20);
+        // Work sessions run whole, under ten seconds.
+        for name in ["laptop", "desktop"] {
+            let i = act_index(name);
+            assert_eq!(reaction_cap(i), WORK_FRAMES);
+            assert!(ACTS[i].frames.len() <= WORK_FRAMES);
+        }
+    }
+
+    #[test]
+    fn no_reaction_during_a_fall_or_a_ride() {
+        let s = build(&[], &[mon()], 72);
+        let mut rng = Rng::new(4);
+        let mut a = Actor::new(900, 0, 4, &mut rng);
+        assert!(a.is_falling());
+        assert!(!a.react(act_index("coffee"), Trigger::Desktop, false));
+        assert!(!a.react(act_index("coffee"), Trigger::User, false));
+        let mut a = walker(&mut rng, &s);
+        a.mode = Mode::Ride {
+            sheet: sheet_index("skate"),
+            frame: 0,
+            cruise: 0,
+            left: 5.0,
+        };
+        assert!(!a.can_react(Trigger::Desktop));
+        a.mode = Mode::Hop { step: 0, twice: false };
+        assert!(!a.can_react(Trigger::Desktop));
+    }
+
+    #[test]
+    fn a_celebration_ends_in_a_double_hop() {
+        let s = build(&[], &[mon()], 72);
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        let mut rng = Rng::new(6);
+        let mut a = walker(&mut rng, &s);
+        assert!(a.react(act_index("excited"), Trigger::User, true));
+        let mut hops = 0;
+        for _ in 0..12 * 4 {
+            a.step(&world, &mut rng);
+            if matches!(a.mode, Mode::Hop { .. }) {
+                hops += 1;
+            }
+        }
+        assert_eq!(hops, 2 * HOP.len());
+    }
+
     fn mon() -> MonitorInfo {
         MonitorInfo {
             rect: Rect::new(0, 0, 1920, 1080),
@@ -574,6 +824,7 @@ mod tests {
         let world = World {
             surfaces: &with,
             idle_secs: 0.0,
+            leans: &[],
         };
         for _ in 0..60 {
             a.step(&world, &mut rng);
@@ -585,6 +836,7 @@ mod tests {
         let world = World {
             surfaces: &without,
             idle_secs: 0.0,
+            leans: &[],
         };
         a.step(&world, &mut rng);
         assert!(a.is_falling());
@@ -606,6 +858,7 @@ mod tests {
         let world = World {
             surfaces: &s,
             idle_secs: 0.0,
+            leans: &[],
         };
         let (mut min, mut max) = (i32::MAX, i32::MIN);
         for _ in 0..12 * 15 {
@@ -628,6 +881,7 @@ mod tests {
         let world = World {
             surfaces: &s,
             idle_secs: 0.0,
+            leans: &[],
         };
         for _ in 0..10 {
             a.step(&world, &mut rng);
@@ -635,6 +889,7 @@ mod tests {
         let idle = World {
             surfaces: &s,
             idle_secs: 200.0,
+            leans: &[],
         };
         a.step(&idle, &mut rng);
         let d = a.describe();
