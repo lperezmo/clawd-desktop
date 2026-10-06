@@ -1,6 +1,27 @@
 # CHANGELOG
 
 
+## v0.4.0 (2026-10-06)
+
+### Features
+
+- Zero gravity during the space act ([#3](https://github.com/lperezmo/clawd-desktop/pull/3),
+  [`8c1035b`](https://github.com/lperezmo/clawd-desktop/commit/8c1035bb90150b66ba2c3030cbf34b0d79b09594))
+
+* feat: zero gravity during the space act
+
+When a Clawd plays the space act, gravity turns off for him: he lifts off gently, drifts slowly
+  inside the work area of his monitor with a soft bob, changing drift and turning now and then,
+  bounces softly off its edges, and falls back onto whatever is below when the act ends. A rider
+  gets down first, and with crowd antics on a Clawd within a body width floats along for under three
+  seconds. Picking him up ends the float.
+
+Right-clicking a Clawd (Clickable on) now shows Float at the top of the menu, which starts the space
+  act on that Clawd.
+
+* feat: the space act comes up on its own now and then
+
+
 ## v0.3.0 (2026-10-06)
 
 ### Features
