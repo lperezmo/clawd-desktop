@@ -67,6 +67,49 @@ const DT: f32 = 1.0 / FPS as f32;
 /// Half of Clawd's body width in sprite pixels: how close to an end he walks.
 pub const HALF_BODY: f32 = 8.0;
 const HOP: [i32; 4] = [-2, -3, -2, -1];
+/// Sprite rows from Clawd's feet to the top of his head while he stands:
+/// where a Clawd riding on him stands.
+pub const HEAD: f32 = 16.0;
+/// Frames a startled Clawd stands with the "?!" over his head.
+pub const STARTLE_FRAMES: usize = 15;
+/// Of those, the first frames shake him from side to side.
+const SHAKE_FRAMES: usize = 6;
+/// Frames a Clawd rides on another before he gets down.
+pub const PERCH_FRAMES: usize = 18;
+
+/// How a Clawd feels after meeting another. It leans his next act, once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Feel {
+    /// After being shoved.
+    Annoyed,
+    /// After company: a chat, a ride, working side by side.
+    Happy,
+}
+
+/// What a feeling leans toward.
+pub const ANNOYED_ACTS: [&str; 4] = ["watch", "turning", "coffee", "meditating"];
+pub const HAPPY_ACTS: [&str; 5] = ["dancing", "dancingHappy", "heart", "jumpingHappy", "rose"];
+/// A feeling is gone after this long, used or not.
+pub const FEEL_SECS: f32 = 60.0;
+
+/// One multiplier per act for a feeling.
+pub fn feel_leans(f: Feel) -> Vec<f32> {
+    crate::leans::from_names(match f {
+        Feel::Annoyed => &ANNOYED_ACTS,
+        Feel::Happy => &HAPPY_ACTS,
+    })
+}
+
+/// What a leap ends in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    /// Walks on.
+    Walk,
+    /// Stands with a shake and a "?!", then walks on.
+    Startled,
+    /// On another Clawd's head, riding him.
+    Perch,
+}
 
 /// What the world looks like this step.
 pub struct World<'a> {
@@ -176,6 +219,30 @@ enum Mode {
     Drag {
         frame: usize,
     },
+    /// Stands still facing `dir` (meeting another Clawd), then walks on,
+    /// turning around first when `then_turn`. `startled` adds the "?!".
+    Stand {
+        left: usize,
+        then_turn: bool,
+        startled: bool,
+        t: usize,
+    },
+    /// A hop from `from_x` to `to_x` over `steps` frames. Lifts are sprite
+    /// pixels above the surface: a leap can start or end on a Clawd's head.
+    Leap {
+        from_x: f32,
+        to_x: f32,
+        from_lift: f32,
+        to_lift: f32,
+        peak: f32,
+        step: usize,
+        steps: usize,
+        then: Landing,
+    },
+    /// Riding on another Clawd's head; the crowd moves him along.
+    Perch {
+        left: usize,
+    },
 }
 
 /// Everything the renderer needs: which frame, which way, where the feet are.
@@ -188,6 +255,8 @@ pub struct Pose {
     pub x: i32,
     /// The row his feet stand on, screen pixels.
     pub y: i32,
+    /// A "?!" bubble over his head.
+    pub mark: bool,
 }
 
 pub struct Actor {
@@ -207,6 +276,10 @@ pub struct Actor {
     sleepy: Vec<f32>,
     /// Seconds until the desktop may start a reaction.
     rest: f32,
+    /// Seconds since he last set off walking.
+    walking_for: f32,
+    /// How he feels after meeting another Clawd, and for how much longer.
+    feel: Option<(Feel, f32)>,
 }
 
 impl Actor {
@@ -227,6 +300,8 @@ impl Actor {
             weights: act_weights(),
             sleepy: sleepy_weights(),
             rest: 0.0,
+            walking_for: 0.0,
+            feel: None,
         }
     }
 
@@ -240,15 +315,145 @@ impl Actor {
         matches!(self.mode, Mode::Walk)
     }
 
-    /// One of the site's acts, its weights times `leans`.
-    pub fn pick(&self, leans: &[f32], rng: &mut Rng) -> usize {
-        pick_weighted(&leaned(&self.weights, leans), rng)
+    /// One of the site's acts, its weights times `leans` and his feeling,
+    /// which this pick uses up.
+    pub fn pick(&mut self, leans: &[f32], rng: &mut Rng) -> usize {
+        let mut w = leaned(&self.weights, leans);
+        if let Some((f, _)) = self.feel.take() {
+            w = leaned(&w, &feel_leans(f));
+        }
+        pick_weighted(&w, rng)
+    }
+
+    #[cfg(test)]
+    pub fn feel(&self) -> Option<Feel> {
+        self.feel.map(|(f, _)| f)
+    }
+
+    pub fn set_feel(&mut self, f: Feel) {
+        self.feel = Some((f, FEEL_SECS));
+    }
+
+    /// Seconds since he last set off walking; zero when not walking.
+    pub fn walking_for(&self) -> f32 {
+        if self.is_walking() { self.walking_for } else { 0.0 }
+    }
+
+    /// The act he is playing, if any.
+    pub fn act_name(&self) -> Option<&'static str> {
+        match self.mode {
+            Mode::Act { act, .. } => Some(ACTS[act].name),
+            _ => None,
+        }
+    }
+
+    /// Frames left of the act he is playing, if any.
+    pub fn act_frames_left(&self) -> Option<usize> {
+        match self.mode {
+            Mode::Act { act, frame, .. } => Some(ACTS[act].frames.len().saturating_sub(frame + 1)),
+            _ => None,
+        }
+    }
+
+    /// Busy with another Clawd: standing for a chat or a startle, leaping,
+    /// or riding. Each of these is over within about three seconds.
+    pub fn is_social(&self) -> bool {
+        matches!(self.mode, Mode::Stand { .. } | Mode::Leap { .. } | Mode::Perch { .. })
+    }
+
+    #[cfg(test)]
+    pub fn is_startled(&self) -> bool {
+        matches!(self.mode, Mode::Stand { startled: true, .. })
+    }
+
+    /// Frames left riding, while he is on another Clawd's head.
+    pub fn perch_left(&self) -> Option<usize> {
+        match self.mode {
+            Mode::Perch { left } => Some(left),
+            _ => None,
+        }
+    }
+
+    /// What the leap he is in ends in, if he is leaping.
+    pub fn leap_landing(&self) -> Option<Landing> {
+        match self.mode {
+            Mode::Leap { then, .. } => Some(then),
+            _ => None,
+        }
+    }
+
+    /// Stops for `frames`, facing the way he is facing, then walks on,
+    /// turning around first when `then_turn`.
+    pub fn stand(&mut self, frames: usize, then_turn: bool) {
+        self.mode = Mode::Stand {
+            left: frames.max(1),
+            then_turn,
+            startled: false,
+            t: 0,
+        };
+    }
+
+    /// Hops to `to_x` over `steps` frames, from wherever he is now (his feet
+    /// or another Clawd's head) to `to_lift` sprite pixels above the surface.
+    pub fn leap(&mut self, to_x: f32, to_lift: f32, peak: f32, steps: usize, then: Landing) {
+        self.mode = Mode::Leap {
+            from_x: self.x,
+            to_x,
+            from_lift: self.lift(),
+            to_lift,
+            peak,
+            step: 0,
+            steps: steps.max(1),
+            then,
+        };
+    }
+
+    /// Moves the end of the leap he is in (the Clawd he is climbing walks on).
+    pub fn retarget(&mut self, x: f32) {
+        if let Mode::Leap { ref mut to_x, .. } = self.mode {
+            *to_x = x;
+        }
+    }
+
+    /// Plays `act` now as an ordinary act from the walk timer, with its
+    /// normal length and the usual chance of a second.
+    pub fn sit_down(&mut self, act: usize) {
+        self.mode = Mode::Act {
+            act,
+            frame: 0,
+            kind: ActKind::Timer,
+            played: 0,
+        };
+    }
+
+    /// Puts off his next act by at least `secs`.
+    pub fn postpone_act(&mut self, secs: f32) {
+        self.next_act_in = self.next_act_in.max(secs);
+    }
+
+    /// Sprite pixels his feet are above the surface: on a leap or a head.
+    fn lift(&self) -> f32 {
+        match self.mode {
+            Mode::Leap {
+                from_lift,
+                to_lift,
+                peak,
+                step,
+                steps,
+                ..
+            } => {
+                let t = step as f32 / steps as f32;
+                from_lift + (to_lift - from_lift) * t + peak * 4.0 * t * (1.0 - t)
+            }
+            Mode::Perch { .. } => HEAD,
+            _ => 0.0,
+        }
     }
 
     /// Whether a reaction from `trigger` may start now.
     pub fn can_react(&self, trigger: Trigger) -> bool {
         match self.mode {
-            Mode::Fall { .. } | Mode::Drag { .. } => false,
+            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Leap { .. } | Mode::Perch { .. } => false,
             _ if trigger == Trigger::User => true,
             Mode::Walk => self.rest <= 0.0,
             Mode::Act { kind, .. } => self.rest <= 0.0 && !matches!(kind, ActKind::Reaction { .. }),
@@ -310,11 +515,17 @@ impl Actor {
             Mode::Fall { .. } => "fall".into(),
             Mode::Hop { .. } => "hop".into(),
             Mode::Drag { .. } => "drag".into(),
+            Mode::Stand { startled: true, .. } => "startled".into(),
+            Mode::Stand { .. } => "stand".into(),
+            Mode::Leap { .. } => "leap".into(),
+            Mode::Perch { .. } => "perch".into(),
         }
     }
 
     pub fn pose(&self) -> Pose {
         let mirrored = self.dir < 0.0;
+        let lift = (self.lift() * self.scale as f32).round() as i32;
+        let (mut dx, mut mark) = (0, false);
         let (sprite, frame, dy) = match self.mode {
             Mode::Walk => (SpriteRef::Sheet(self.walk), self.walk_frame, 0),
             Mode::Act { act, frame, .. } => (SpriteRef::Act(act), frame, 0),
@@ -325,20 +536,38 @@ impl Actor {
                 0,
                 HOP[step.min(HOP.len() - 1)] * self.scale,
             ),
+            Mode::Stand { startled, t, .. } => {
+                mark = startled;
+                if startled && t < SHAKE_FRAMES {
+                    dx = if t % 2 == 0 { self.scale } else { -self.scale };
+                }
+                (SpriteRef::Sheet(self.walk), 0, 0)
+            }
+            Mode::Leap { .. } | Mode::Perch { .. } => (SpriteRef::Sheet(self.walk), 0, -lift),
         };
         Pose {
             sprite,
             frame,
             mirrored,
-            x: self.x.round() as i32,
+            x: self.x.round() as i32 + dx,
             y: self.y.round() as i32 + dy,
+            mark,
         }
     }
 
     fn start_walk(&mut self, rng: &mut Rng) {
         self.mode = Mode::Walk;
         self.walk_frame = 0;
+        self.walking_for = 0.0;
         self.next_act_in = rng.range(ACT_GAP.0, ACT_GAP.1);
+    }
+
+    /// Walks on after meeting another Clawd, keeping his act timer.
+    fn resume_walk(&mut self) {
+        self.mode = Mode::Walk;
+        self.walk_frame = 0;
+        self.walking_for = 0.0;
+        self.next_act_in = self.next_act_in.max(1.0);
     }
 
     fn start_fall(&mut self) {
@@ -354,6 +583,12 @@ impl Actor {
     /// Advances one frame.
     pub fn step(&mut self, world: &World, rng: &mut Rng) {
         self.rest = (self.rest - DT).max(0.0);
+        if let Some((_, left)) = self.feel.as_mut() {
+            *left -= DT;
+            if *left <= 0.0 {
+                self.feel = None;
+            }
+        }
         if let Mode::Drag { frame } = self.mode {
             self.mode = Mode::Drag {
                 frame: (frame + 1) % frame_count(SpriteRef::Act(self.turning)),
@@ -369,6 +604,8 @@ impl Actor {
         }
 
         let Some((si, owner)) = support(world.surfaces, xi, yi, self.owner) else {
+            // Falls from where he is seen: up on a leap or a head.
+            self.y -= self.lift() * self.scale as f32;
             self.start_fall();
             return;
         };
@@ -443,6 +680,79 @@ impl Actor {
                     self.start_walk(rng);
                 }
             }
+            Mode::Stand {
+                left,
+                then_turn,
+                startled,
+                t,
+            } => {
+                if left > 1 {
+                    self.mode = Mode::Stand {
+                        left: left - 1,
+                        then_turn,
+                        startled,
+                        t: t + 1,
+                    };
+                } else {
+                    if then_turn {
+                        self.turn_around();
+                    }
+                    self.resume_walk();
+                }
+            }
+            Mode::Leap {
+                from_x,
+                to_x,
+                from_lift,
+                to_lift,
+                peak,
+                step,
+                steps,
+                then,
+            } => {
+                let step = step + 1;
+                let t = step as f32 / steps as f32;
+                self.x = from_x + (to_x - from_x) * t;
+                let (lo, hi) = self.bounds(s);
+                if hi > lo {
+                    self.x = self.x.clamp(lo, hi);
+                }
+                self.mode = if step < steps {
+                    Mode::Leap {
+                        from_x,
+                        to_x,
+                        from_lift,
+                        to_lift,
+                        peak,
+                        step,
+                        steps,
+                        then,
+                    }
+                } else {
+                    match then {
+                        Landing::Walk => {
+                            self.resume_walk();
+                            return;
+                        }
+                        Landing::Startled => Mode::Stand {
+                            left: STARTLE_FRAMES,
+                            then_turn: false,
+                            startled: true,
+                            t: 0,
+                        },
+                        Landing::Perch => Mode::Perch { left: PERCH_FRAMES },
+                    }
+                };
+            }
+            Mode::Perch { left } => {
+                if left == 0 {
+                    // Nobody got him down: hop off forward on his own.
+                    let to = self.x + self.dir * 2.0 * HALF_BODY * self.scale as f32;
+                    self.leap(to, 0.0, 4.0, 6, Landing::Walk);
+                } else {
+                    self.mode = Mode::Perch { left: left - 1 };
+                }
+            }
             Mode::Fall { .. } | Mode::Drag { .. } => unreachable!(),
         }
     }
@@ -490,6 +800,7 @@ impl Actor {
 
     fn walk_step(&mut self, world: &World, s: &Surface, rng: &mut Rng) {
         let sheet = &SHEETS[self.walk];
+        self.walking_for += DT;
         if world.idle_secs >= SLEEP_AFTER_SECS {
             let act = pick_weighted(&self.sleepy, rng);
             self.mode = Mode::Act {
@@ -863,6 +1174,39 @@ mod tests {
             a.step(&world, &mut rng);
         }
         assert_eq!(a.pose().y, 1032);
+    }
+
+    #[test]
+    fn a_feeling_leans_the_next_pick_once_then_fades() {
+        let s = build(&[], &[mon()], 72);
+        let mut rng = Rng::new(12);
+        let mut a = walker(&mut rng, &s);
+        for (feel, names) in [(Feel::Happy, &HAPPY_ACTS[..]), (Feel::Annoyed, &ANNOYED_ACTS[..])] {
+            let (mut with, mut without) = (0, 0);
+            for _ in 0..20_000 {
+                a.set_feel(feel);
+                with += names.contains(&ACTS[a.pick(&[], &mut rng)].name) as u32;
+                assert_eq!(a.feel(), None, "used up by one pick");
+                without += names.contains(&ACTS[a.pick(&[], &mut rng)].name) as u32;
+            }
+            assert!(with as f32 > 2.0 * without as f32, "{feel:?}: {with} vs {without}");
+        }
+        // Unused, it fades after a minute.
+        let world = World {
+            surfaces: &s,
+            idle_secs: 0.0,
+            leans: &[],
+        };
+        a.set_feel(Feel::Annoyed);
+        a.next_act_in = 1000.0;
+        for _ in 0..(FEEL_SECS * FPS as f32) as usize - 2 {
+            a.step(&world, &mut rng);
+        }
+        assert_eq!(a.feel(), Some(Feel::Annoyed));
+        for _ in 0..3 {
+            a.step(&world, &mut rng);
+        }
+        assert_eq!(a.feel(), None);
     }
 
     #[test]

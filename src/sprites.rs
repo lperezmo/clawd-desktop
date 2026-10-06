@@ -119,6 +119,41 @@ pub fn max_size() -> (usize, usize) {
     (w, h)
 }
 
+/// The "?!" a startled Clawd shows, as clawd-buddy says it: dark text in a
+/// small light bubble. `#` is text, `o` the bubble, `.` clear.
+const MARK: [&str; 7] = [
+    ".ooooo.", "o###o#o", "ooo#o#o", "oo##o#o", "ooooooo", "oo#oo#o", ".ooooo.",
+];
+const MARK_TEXT: u32 = 0x141413;
+const MARK_FILL: u32 = 0xf9f8f4;
+/// Sprite rows the "?!" adds above a frame: the bubble and one row of gap.
+pub const MARK_ROWS: usize = MARK.len() + 1;
+
+/// Adds `MARK_ROWS` sprite rows on top of a rendered image (`w` screen
+/// pixels wide, premultiplied BGRA) and draws the "?!" in them, centred on
+/// column `cx` and kept inside the image.
+pub fn add_mark(buf: &mut Vec<u32>, w: usize, scale: usize, cx: i32) {
+    let rows = MARK_ROWS * scale;
+    buf.splice(0..0, std::iter::repeat_n(0, w * rows));
+    let mw = MARK[0].len() * scale;
+    let left = (cx - mw as i32 / 2).clamp(0, w.saturating_sub(mw) as i32) as usize;
+    for (sy, row) in MARK.iter().enumerate() {
+        for (sx, ch) in row.bytes().enumerate() {
+            let c = match ch {
+                b'#' => MARK_TEXT,
+                b'o' => MARK_FILL,
+                _ => continue,
+            };
+            for yy in 0..scale {
+                let base = (sy * scale + yy) * w + left + sx * scale;
+                if let Some(px) = buf.get_mut(base..base + scale) {
+                    px.fill(0xff00_0000 | c);
+                }
+            }
+        }
+    }
+}
+
 impl Frame {
     /// Left edge in screen pixels when Clawd's centre line is at `cx`.
     pub fn left(&self, cx: i32, scale: i32, mirrored: bool) -> i32 {
@@ -216,5 +251,26 @@ mod tests {
             }
         }
         assert_eq!(fr.left(100, 3, false), 100 - 12 * 3);
+    }
+
+    #[test]
+    fn mark_sits_above_the_frame_and_fits_the_overlay() {
+        let fr = frame(SpriteRef::Sheet(sheet_index("walk")), 0);
+        let scale = 2;
+        let mut buf = Vec::new();
+        fr.render(scale, true, &mut buf);
+        let plain = buf.clone();
+        let w = fr.w * scale;
+        add_mark(&mut buf, w, scale, (fr.w - fr.anchor as usize) as i32 * scale as i32);
+        let rows = MARK_ROWS * scale;
+        assert_eq!(buf.len(), plain.len() + w * rows);
+        // The frame itself is unchanged, just lower.
+        assert_eq!(&buf[w * rows..], &plain[..]);
+        // Dark text and a light fill, nothing in the gap row.
+        assert!(buf[..w * rows].contains(&(0xff00_0000 | MARK_TEXT)));
+        assert!(buf[..w * rows].contains(&(0xff00_0000 | MARK_FILL)));
+        assert!(buf[w * (rows - scale)..w * rows].iter().all(|&p| p == 0));
+        // A walk frame with the mark still fits the overlay window.
+        assert!(fr.h + MARK_ROWS <= max_size().1);
     }
 }

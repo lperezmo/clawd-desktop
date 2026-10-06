@@ -8,7 +8,7 @@ Clawd, the pixel lobster from claude.dev, walks along the top edges of your wind
 
 - **Surfaces**: he walks on the visible top edge of every window and on the taskbar, turns at the ends, and rides along when you drag the window he is standing on.
 - **Falling**: when that window closes, minimizes or moves out from under him, he falls to the next edge below.
-- **Company**: with more than one Clawd, each keeps his own pace and timers; two walking into each other turn apart instead of passing through.
+- **Company**: with more than one Clawd, each keeps his own pace and timers, and two walking into each other never pass through. When two meet head on they stop and face each other for a beat before one turns, as if chatting; now and then one climbs on the other and rides him for a moment (never three high), and rarely the one who was walking longer shoves, so the other hops over him and lands behind with a startled "?!". While Claude Code is locked in, or when one walks up to another at his laptop, they sit down with their laptops back to back or facing each other. A chat or a ride leaves him happy, a shove annoyed, and that leans his next act. None of it lasts more than about three seconds, apart from the laptops, which are ordinary laptop acts.
 
 He hides while a fullscreen app is in front.
 
@@ -44,6 +44,7 @@ That copies it to `%LOCALAPPDATA%\Programs\clawd-desktop\clawd-desktop.exe` and 
 - Scale: 2x, 3x, 4x, 6x
 - Clickable (on by default): off, the mouse goes straight through him as before.
 - Follow Claude Code (on by default): reads `%LOCALAPPDATA%\clawd\sessions`, which clawd-buddy writes; nothing happens if it does not exist.
+- Crowd antics (on by default, `crowd_antics` in config.toml): off, Clawds that meet only turn apart.
 - Hide while fullscreen (on by default)
 - Start with Windows
 - Quit

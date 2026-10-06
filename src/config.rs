@@ -19,6 +19,8 @@ pub struct Config {
     pub clickable: bool,
     /// Lean on Claude Code's mood from clawd-buddy's session files.
     pub follow_claude: bool,
+    /// Clawds that meet chat, shove, ride each other and work side by side.
+    pub crowd_antics: bool,
 }
 
 impl Default for Config {
@@ -30,6 +32,7 @@ impl Default for Config {
             count: 1,
             clickable: true,
             follow_claude: true,
+            crowd_antics: true,
         }
     }
 }
@@ -91,6 +94,7 @@ mod tests {
             count: 4,
             clickable: false,
             follow_claude: false,
+            crowd_antics: false,
         };
         let s = toml::to_string(&c).unwrap();
         assert_eq!(toml::from_str::<Config>(&s).unwrap(), c);
@@ -105,6 +109,7 @@ mod tests {
         assert_eq!(partial.count, 1);
         assert!(partial.clickable, "clickable by default");
         assert!(partial.follow_claude, "follows Claude Code by default");
+        assert!(partial.crowd_antics, "crowd antics on by default");
         let three: Config = toml::from_str(
             "count = 3
 paused = true",
