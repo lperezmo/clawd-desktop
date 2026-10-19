@@ -1,6 +1,6 @@
 # Clawd Desktop
 
-Clawd, the pixel lobster from claude.dev, walks along the top edges of your windows and the taskbar on Windows. He lives in transparent, topmost overlay windows that never take focus and do not show up in Alt-Tab; only his own pixels take the mouse, and only while Clickable is on. Up to five of him can walk at once.
+Clawd, the pixel crab from claude.dev, walks along the top edges of your windows and the taskbar on Windows. He lives in transparent, topmost overlay windows that never take focus and do not show up in Alt-Tab; only his own pixels take the mouse, and only while Clickable is on. Up to five of him can walk at once.
 
 <p align="center"><img src="assets/clawd-256.png" width="128" alt="Clawd"></p>
 
