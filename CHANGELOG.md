@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.4.1 (2026-10-19)
+
+### Bug Fixes
+
+- Arrow cursor over Clawd instead of the launch spinner
+  ([`d3f5029`](https://github.com/lperezmo/clawd-desktop/commit/d3f5029fad0cb62cf04acfe7c14120c6de90ead0))
+
+### Documentation
+
+- Clawd is a pixel crab
+  ([`dabebe3`](https://github.com/lperezmo/clawd-desktop/commit/dabebe3da2b867d6b04834b890049eca783ec79d))
+
+
 ## v0.4.0 (2026-10-06)
 
 ### Features
