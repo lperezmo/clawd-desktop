@@ -24,10 +24,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, HTCLIENT,
-    HTTRANSPARENT, MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetWindowLongPtrW, ShowWindow, ULW_ALPHA,
-    UpdateLayeredWindow, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    HTTRANSPARENT, IDC_ARROW, LoadCursorW, MA_NOACTIVATE, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SetWindowLongPtrW, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -162,6 +162,8 @@ pub fn register_class() {
             style: CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(None).unwrap_or_default().into(),
+            // Without a class cursor Windows keeps the launch spinner over him.
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: CLASS,
             ..Default::default()
         };
