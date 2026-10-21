@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-10-21)
+
+### Features
+
+- Free roam lanes and climbing the screen edges
+  ([#4](https://github.com/lperezmo/clawd-desktop/pull/4),
+  [`4c8161f`](https://github.com/lperezmo/clawd-desktop/commit/4c8161f02c11a8331162d59d3a6423025a02879c))
+
+Free roam adds invisible full-width lanes every 1.5 of his heights above the taskbar, like the
+  phone. While walking he now and then rolls to stay, hop up onto the surface above (a lane or a
+  window top) or drop to the one below, weighed by depth so he spreads over the screen.
+
+Climb walls: walking into a screen edge he often turns a quarter and walks up or down it to another
+  floor touching the edge, or partway up and back when there is none, then steps off. The walk sheet
+  is rotated, not mirrored.
+
+Both are tray toggles (config keys free_roam, climb_walls), off by default.
+
+
 ## v0.4.1 (2026-10-19)
 
 ### Bug Fixes

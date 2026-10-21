@@ -1,6 +1,6 @@
 [package]
 name = "clawd-desktop"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Clawd walks along the edges of your windows and the taskbar."
 license = "MIT"
