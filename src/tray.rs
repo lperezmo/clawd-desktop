@@ -29,6 +29,8 @@ pub enum Command {
     ToggleClickable,
     ToggleFollow,
     ToggleAntics,
+    ToggleRoam,
+    ToggleClimb,
     Perform,
     /// The Clawd the menu was opened on plays the space act in zero g.
     Float,
@@ -44,6 +46,8 @@ const ID_FOLLOW: usize = 6;
 const ID_PERFORM: usize = 7;
 const ID_ANTICS: usize = 8;
 const ID_FLOAT: usize = 9;
+const ID_ROAM: usize = 10;
+const ID_CLIMB: usize = 11;
 const ID_SCALE: usize = 100;
 const ID_COUNT: usize = 200;
 
@@ -138,6 +142,8 @@ impl Tray {
                 w!("Follow Claude Code"),
             );
             let _ = AppendMenuW(m, MF_STRING | check(cfg.crowd_antics), ID_ANTICS, w!("Crowd antics"));
+            let _ = AppendMenuW(m, MF_STRING | check(cfg.free_roam), ID_ROAM, w!("Free roam"));
+            let _ = AppendMenuW(m, MF_STRING | check(cfg.climb_walls), ID_CLIMB, w!("Climb walls"));
             let _ = AppendMenuW(
                 m,
                 MF_STRING | check(cfg.hide_fullscreen),
@@ -184,6 +190,8 @@ fn command(id: usize) -> Option<Command> {
         ID_CLICKABLE => Some(Command::ToggleClickable),
         ID_FOLLOW => Some(Command::ToggleFollow),
         ID_ANTICS => Some(Command::ToggleAntics),
+        ID_ROAM => Some(Command::ToggleRoam),
+        ID_CLIMB => Some(Command::ToggleClimb),
         ID_PERFORM => Some(Command::Perform),
         ID_FLOAT => Some(Command::Float),
         ID_QUIT => Some(Command::Quit),
@@ -227,6 +235,8 @@ mod tests {
             ID_PERFORM,
             ID_ANTICS,
             ID_FLOAT,
+            ID_ROAM,
+            ID_CLIMB,
         ];
         for (k, id) in plain.iter().enumerate() {
             assert!(*id < ID_SCALE);

@@ -1,5 +1,5 @@
 //! Walkable surfaces: window top edges and the taskbar top, in physical
-//! screen pixels.
+//! screen pixels, plus the invisible lanes of free roam.
 //!
 //! `build` is pure so it can be tested; `scan_windows` and `scan_monitors`
 //! read the live desktop.
@@ -42,6 +42,8 @@ impl Rect {
 
 /// Owner id of the taskbar ground; windows use their HWND value.
 pub const GROUND: isize = 0;
+/// Owner id of an invisible free-roam lane.
+pub const LANE: isize = -1;
 
 /// Two segments at the same y closer than this merge into one surface.
 const MERGE_GAP: i32 = 2;
@@ -70,9 +72,13 @@ impl Surface {
         x >= self.x0 && x < self.x1
     }
     pub fn owner_at(&self, x: i32) -> isize {
+        // A window or the ground under him beats a lane: he rides it.
+        let under = |p: &&Part| x >= p.x0 && x < p.x1;
         self.parts
             .iter()
-            .find(|p| x >= p.x0 && x < p.x1)
+            .filter(under)
+            .find(|p| p.owner != LANE)
+            .or_else(|| self.parts.iter().find(under))
             .or(self.parts.first())
             .map_or(GROUND, |p| p.owner)
     }
@@ -114,7 +120,15 @@ fn subtract(spans: &mut Vec<(i32, i32)>, a: i32, b: i32) {
 /// only on a monitor, at least `headroom` pixels below the monitor top (so
 /// Clawd fits above it) and above the taskbar. Each monitor's work-area
 /// bottom is ground. Touching segments at the same y merge.
+#[cfg(test)]
 pub fn build(windows: &[WindowInfo], monitors: &[MonitorInfo], headroom: i32) -> Vec<Surface> {
+    build_with(windows, monitors, headroom, None)
+}
+
+/// `build`, plus with `lanes` (free roam) an invisible full-width lane on
+/// every monitor every `lanes` pixels above its work-area bottom, up to
+/// `headroom` below its top, the way the phone has them.
+pub fn build_with(windows: &[WindowInfo], monitors: &[MonitorInfo], headroom: i32, lanes: Option<i32>) -> Vec<Surface> {
     let mut segs: Vec<(i32, Part, bool)> = Vec::new();
     for (i, w) in windows.iter().enumerate() {
         let y = w.rect.top;
@@ -162,6 +176,23 @@ pub fn build(windows: &[WindowInfo], monitors: &[MonitorInfo], headroom: i32) ->
             ));
         }
     }
+    if let Some(spacing) = lanes.filter(|&g| g > 0) {
+        for m in monitors {
+            let mut y = m.work.bottom - spacing;
+            while y >= m.rect.top + headroom {
+                segs.push((
+                    y,
+                    Part {
+                        x0: m.rect.left,
+                        x1: m.rect.right,
+                        owner: LANE,
+                    },
+                    false,
+                ));
+                y -= spacing;
+            }
+        }
+    }
     segs.sort_by_key(|(y, p, _)| (*y, p.x0, p.x1));
 
     let mut out: Vec<Surface> = Vec::new();
@@ -201,7 +232,7 @@ pub fn fall_target(surfaces: &[Surface], x: i32, y: i32) -> Option<usize> {
 /// that window still has one (it may have moved), otherwise any surface at
 /// exactly `y` under `x`.
 pub fn support(surfaces: &[Surface], x: i32, y: i32, owner: isize) -> Option<(usize, isize)> {
-    if owner != GROUND {
+    if owner != GROUND && owner != LANE {
         for (i, s) in surfaces.iter().enumerate() {
             if s.parts.iter().any(|p| p.owner == owner && x >= p.x0 && x < p.x1) {
                 return Some((i, owner));
@@ -212,6 +243,17 @@ pub fn support(surfaces: &[Surface], x: i32, y: i32, owner: isize) -> Option<(us
         .iter()
         .position(|s| s.y == y && s.contains_x(x))
         .map(|i| (i, surfaces[i].owner_at(x)))
+}
+
+/// The nearest surface above feet at `y` that spans `x`, no more than
+/// `reach` pixels up: where a hop up from (`x`, `y`) lands.
+pub fn hop_target(surfaces: &[Surface], x: i32, y: i32, reach: i32) -> Option<usize> {
+    surfaces
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.y < y && s.y >= y - reach && s.contains_x(x))
+        .max_by_key(|(_, s)| s.y)
+        .map(|(i, _)| i)
 }
 
 /// The ground surface nearest to `x`, used when Clawd ends up with nothing below.
@@ -480,6 +522,44 @@ mod tests {
         assert_eq!(t(1000, 1032), None);
         // Starting exactly on a surface does not land on it again.
         assert_eq!(t(200, 300), Some(1032));
+    }
+
+    #[test]
+    fn lanes_hang_above_the_ground_and_stop_below_the_top() {
+        let s = build_with(&[], &[mon()], 72, Some(81));
+        let ys: Vec<i32> = s.iter().map(|s| s.y).collect();
+        assert_eq!(*ys.last().unwrap(), 1032);
+        assert!(s.last().unwrap().ground);
+        let lanes: Vec<&Surface> = s.iter().filter(|s| !s.ground).collect();
+        assert_eq!(lanes.len(), (1032 - 72) / 81);
+        for l in &lanes {
+            assert_eq!((l.x0, l.x1), (0, 1920));
+            assert_eq!((1032 - l.y) % 81, 0);
+            assert!(l.y >= 72);
+            assert_eq!(l.owner_at(500), LANE);
+        }
+        assert_eq!(build_with(&[], &[mon()], 72, None), build(&[], &[mon()], 72));
+    }
+
+    #[test]
+    fn a_window_top_on_a_lane_keeps_its_owner() {
+        let s = build_with(&[win(5, 100, 1032 - 81, 900, 1032)], &[mon()], 72, Some(81));
+        let row = s.iter().find(|s| s.y == 1032 - 81).unwrap();
+        assert_eq!((row.x0, row.x1), (0, 1920));
+        assert_eq!(row.owner_at(500), 5);
+        // Standing on a lane is like standing on the ground: found by its y.
+        let lane = s.iter().position(|s| s.y == 1032 - 162).unwrap();
+        assert_eq!(support(&s, 50, 1032 - 162, LANE), Some((lane, LANE)));
+    }
+
+    #[test]
+    fn hop_goes_to_the_nearest_surface_above_within_reach() {
+        let s = build_with(&[win(1, 100, 900, 500, 1000)], &[mon()], 72, Some(300));
+        let t = |x, y, r| hop_target(&s, x, y, r).map(|i| s[i].y);
+        assert_eq!(t(200, 1032, 200), Some(900));
+        assert_eq!(t(700, 1032, 200), None, "no window there and the lane is too high");
+        assert_eq!(t(700, 1032, 400), Some(732));
+        assert_eq!(t(200, 900, 200), Some(732));
     }
 
     #[test]

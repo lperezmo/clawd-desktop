@@ -465,7 +465,7 @@ impl Crowd {
     /// another Clawd: only the plain rule applies to him.
     fn busy(&self, i: usize) -> bool {
         let a = &self.members[i].actor;
-        self.in_stack(i) || self.calm[i] > 0 || a.is_social() || a.is_floating()
+        self.in_stack(i) || self.calm[i] > 0 || a.is_social() || a.is_floating() || a.is_climbing()
     }
 
     fn in_stack(&self, i: usize) -> bool {
@@ -729,6 +729,9 @@ mod tests {
             surfaces: s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         }
     }
 

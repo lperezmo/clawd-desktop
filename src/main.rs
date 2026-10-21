@@ -23,7 +23,7 @@ use config::Config;
 use crowd::Crowd;
 use log::{debug, info, warn};
 use overlay::{Mouse, Overlay};
-use sprites::{ACTS, FPS, act_index, frame, max_size, sheet_index};
+use sprites::{ACTS, FPS, Rot, act_index, frame, max_size, sheet_index};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -450,7 +450,11 @@ impl App {
 
     fn rebuild_surfaces(&mut self) {
         let wins = surfaces::scan::windows();
-        self.surfaces = surfaces::build(&wins, &self.monitors, self.headroom());
+        let lanes = self
+            .cfg
+            .free_roam
+            .then(|| (actor::LANE_SPACING * (SHEETS_WALK_H * self.scale) as f32).round() as i32);
+        self.surfaces = surfaces::build_with(&wins, &self.monitors, self.headroom(), lanes);
         self.fullscreen = surfaces::scan::foreground_is_fullscreen();
         self.last_rebuild = Instant::now();
         self.rebuilds += 1;
@@ -515,20 +519,32 @@ impl App {
             };
             (id << 32) ^ ((pose.frame as u64) << 8) ^ ((pose.mirrored as u64) << 7) ^ (s as u64)
         };
-        let key = key ^ ((pose.mark as u64) << 6);
+        let key = key ^ ((pose.mark as u64) << 6) ^ ((pose.rot as u64) << 4);
         let left = f.left(pose.x, s, pose.mirrored);
-        let (sw, sh) = (
+        let (fw, fh) = (
             f.w as i32 * s,
             (f.h + if pose.mark { sprites::MARK_ROWS } else { 0 }) as i32 * s,
         );
         if v.buf_key != Some(key) {
             f.render(s as usize, pose.mirrored, &mut v.buf);
             if pose.mark {
-                sprites::add_mark(&mut v.buf, sw as usize, s as usize, pose.x - left);
+                sprites::add_mark(&mut v.buf, fw as usize, s as usize, pose.x - left);
+            }
+            if pose.rot != Rot::Upright {
+                let upright = std::mem::take(&mut v.buf);
+                sprites::rotate(&upright, fw as usize, fh as usize, pose.rot, &mut v.buf);
             }
             v.buf_key = Some(key);
         }
-        let pos = (left, pose.y - sh);
+        // On a wall `x` is the edge and `y` the middle of his body along it;
+        // his centre column lands `anchor` rows down (left edge) or up
+        // from the bottom (right edge).
+        let anchor = pose.x - left;
+        let ((sw, sh), pos) = match pose.rot {
+            Rot::Upright => ((fw, fh), (left, pose.y - fh)),
+            Rot::Left => ((fh, fw), (pose.x, pose.y - anchor)),
+            Rot::Right => ((fh, fw), (pose.x - fh, pose.y - (fw - anchor))),
+        };
         v.origin = pos;
         v.size = (sw, sh);
         let mut drew = false;
@@ -794,6 +810,11 @@ impl App {
                 self.cfg.crowd_antics = !self.cfg.crowd_antics;
                 self.crowd.antics = self.cfg.crowd_antics;
             }
+            Command::ToggleRoam => {
+                self.cfg.free_roam = !self.cfg.free_roam;
+                self.rebuild_surfaces();
+            }
+            Command::ToggleClimb => self.cfg.climb_walls = !self.cfg.climb_walls,
             Command::ToggleStartup => {
                 if let Err(e) = install::set_startup(!install::startup_enabled()) {
                     warn!("start with Windows: {e}");
@@ -1141,10 +1162,14 @@ fn run(args: &Args) -> i32 {
             }
         }
         if !hide && now >= next_step {
+            let areas: Vec<surfaces::Rect> = app.monitors.iter().map(|m| m.work).collect();
             let world = World {
                 surfaces: &app.surfaces,
                 idle_secs: idle_secs(),
                 leans: &app.leans,
+                areas: &areas,
+                roam: app.cfg.free_roam,
+                climb: app.cfg.climb_walls,
             };
             for e in app.crowd.step(&world) {
                 info!("{e}");

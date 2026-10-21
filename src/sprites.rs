@@ -47,6 +47,38 @@ pub enum SpriteRef {
     Act(usize),
 }
 
+/// Which way a drawn frame is turned: upright, or a quarter turn with his
+/// feet against the left or the right screen edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rot {
+    #[default]
+    Upright,
+    Left,
+    Right,
+}
+
+/// Turns a `w` by `h` image so its bottom row lies against the left edge
+/// (`Rot::Left`) or the right one; the result is `h` wide and `w` tall.
+/// Both are true rotations, never a reflection. Upright copies it.
+pub fn rotate(src: &[u32], w: usize, h: usize, rot: Rot, out: &mut Vec<u32>) {
+    out.clear();
+    if rot == Rot::Upright {
+        out.extend_from_slice(src);
+        return;
+    }
+    out.resize(w * h, 0);
+    for y in 0..h {
+        for x in 0..w {
+            let (col, row) = if rot == Rot::Right {
+                (y, w - 1 - x)
+            } else {
+                (h - 1 - y, x)
+            };
+            out[row * h + col] = src[y * w + x];
+        }
+    }
+}
+
 /// One frame ready to draw.
 pub struct Frame {
     pub w: usize,
@@ -251,6 +283,38 @@ mod tests {
             }
         }
         assert_eq!(fr.left(100, 3, false), 100 - 12 * 3);
+    }
+
+    #[test]
+    fn rotation_puts_his_feet_on_the_wall() {
+        let fr = frame(SpriteRef::Sheet(sheet_index("walk")), 0);
+        let mut up = Vec::new();
+        fr.render(1, false, &mut up);
+        let (w, h) = (fr.w, fr.h);
+        let opaque = |b: &[u32], i: usize| b[i] >> 24 != 0;
+        for (rot, feet_col) in [(Rot::Right, h - 1), (Rot::Left, 0)] {
+            let mut out = Vec::new();
+            rotate(&up, w, h, rot, &mut out);
+            assert_eq!(out.len(), w * h);
+            // His bottom row (feet) becomes the column against the wall.
+            let feet = (0..w).filter(|&x| opaque(&up, (h - 1) * w + x)).count();
+            let wall = (0..w).filter(|&r| opaque(&out, r * h + feet_col)).count();
+            assert_eq!(feet, wall, "{rot:?}");
+            // Same pixels, just moved.
+            assert_eq!(
+                (0..w * h).filter(|&i| opaque(&up, i)).count(),
+                (0..w * h).filter(|&i| opaque(&out, i)).count()
+            );
+        }
+        // Left then right is a half turn, not the original.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        rotate(&up, w, h, Rot::Left, &mut a);
+        rotate(&a, h, w, Rot::Left, &mut b);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(b[(h - 1 - y) * w + (w - 1 - x)], up[y * w + x]);
+            }
+        }
     }
 
     #[test]
