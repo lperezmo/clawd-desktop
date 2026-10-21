@@ -1,8 +1,8 @@
 //! Clawd's behaviour: walking, acts, rides, falling. Advances in fixed steps
 //! of one animation frame (1/12 s) and knows nothing about Win32.
 
-use crate::sprites::{ACTS, FPS, SHEETS, SpriteRef, act_index, frame_count, sheet_index};
-use crate::surfaces::{GROUND, Rect, Surface, fall_target, nearest_ground, support};
+use crate::sprites::{ACTS, FPS, Rot, SHEETS, SpriteRef, act_index, frame_count, sheet_index};
+use crate::surfaces::{GROUND, LANE, Rect, Surface, fall_target, hop_target, nearest_ground, support};
 
 /// splitmix64: small, seedable, good enough for picking acts.
 #[derive(Clone)]
@@ -96,6 +96,26 @@ const PASSENGER_EASE: f32 = 0.25;
 /// The soft bob while floating: sprite pixels up, and frames per bob.
 const BOB: f32 = 2.0;
 const BOB_FRAMES: f32 = 36.0;
+/// Free roam: invisible lanes this many of his heights apart, like the phone.
+pub const LANE_SPACING: f32 = 1.5;
+/// Seconds of walking between rolls for a hop up or a drop.
+const LANE_GAP: (f32, f32) = (3.0, 8.0);
+/// The roll, as on the phone: staying weighs this much, twice that on a
+/// floor you can see (a window top or the ground); a hop up gains
+/// `UP_BIAS` the lower he is, a drop `DROP_BIAS` the higher.
+const ROAM_STAY: f32 = 3.0;
+const ANCHOR_STAY: f32 = 2.0;
+const UP_BIAS: f32 = 3.0;
+const DROP_BIAS: f32 = 1.5;
+/// A hop up reaches this many lane spacings.
+const HOP_REACH: f32 = 1.25;
+/// Frames of a hop up, and sprite pixels it rises over the higher end.
+const JUMP_STEPS: usize = 8;
+const JUMP_PEAK: f32 = 6.0;
+/// How often he climbs when he walks into a screen edge.
+pub const CLIMB_CHANCE: f32 = 0.6;
+/// Half his length along a wall, sprite pixels: half the walk sheet's width.
+const WALL_HALF: f32 = 12.0;
 /// A Clawd beside a floater floats along this long, then drops: well
 /// inside three seconds with the fall and the landing hop.
 pub const PASSENGER_FRAMES: usize = 20;
@@ -141,6 +161,12 @@ pub struct World<'a> {
     /// Multipliers on the site's weights, one per act (time of day, media,
     /// battery, Claude Code's mood). Empty for none.
     pub leans: &'a [f32],
+    /// Monitor work areas: their sides are the walls he climbs.
+    pub areas: &'a [Rect],
+    /// Free roam: he hops up and drops between surfaces now and then.
+    pub roam: bool,
+    /// He climbs the screen edges.
+    pub climb: bool,
 }
 
 /// Why an act is playing, which decides what follows it.
@@ -268,6 +294,22 @@ enum Mode {
     },
     /// Zero g: drifting through the air, surfaces ignored.
     Float(Float),
+    /// Free roam: a hop straight up from feet at `from_y` onto the surface
+    /// at `to_y`.
+    Jump {
+        from_y: f32,
+        to_y: f32,
+        step: usize,
+    },
+    /// On a screen edge, turned a quarter: `side` is -1 for the left edge
+    /// and 1 for the right, `x` is the edge and `y` the middle of his body.
+    /// He walks to `to_y`, then to `back_to` if set (a look up the wall with
+    /// nowhere to get off), and steps off onto the floor his body touches.
+    Wall {
+        side: f32,
+        to_y: f32,
+        back_to: Option<f32>,
+    },
 }
 
 /// A float: the space sheet played in the air, or a short float along
@@ -328,6 +370,9 @@ pub struct Pose {
     pub y: i32,
     /// A "?!" bubble over his head.
     pub mark: bool,
+    /// Turned onto a screen edge. Then `x` is the edge and `y` the middle
+    /// of his body along it.
+    pub rot: Rot,
 }
 
 pub struct Actor {
@@ -355,6 +400,8 @@ pub struct Actor {
     space_wish: bool,
     /// How he feels after meeting another Clawd, and for how much longer.
     feel: Option<(Feel, f32)>,
+    /// Free roam: seconds of walking until the next hop-or-drop roll.
+    lane_in: f32,
 }
 
 impl Actor {
@@ -379,6 +426,7 @@ impl Actor {
             rest: 0.0,
             walking_for: 0.0,
             feel: None,
+            lane_in: LANE_GAP.0,
         }
     }
 
@@ -390,6 +438,11 @@ impl Actor {
     /// Walking along a surface (not acting, riding, hopping or falling).
     pub fn is_walking(&self) -> bool {
         matches!(self.mode, Mode::Walk)
+    }
+
+    /// On a screen edge or hopping up a lane.
+    pub fn is_climbing(&self) -> bool {
+        matches!(self.mode, Mode::Wall { .. } | Mode::Jump { .. })
     }
 
     /// One of the site's acts, its weights times `leans` and his feeling,
@@ -446,7 +499,10 @@ impl Actor {
     }
 
     fn lift_off(&mut self, areas: &[Rect], passenger: bool, rng: &mut Rng) -> bool {
-        if matches!(self.mode, Mode::Fall { .. } | Mode::Drag { .. } | Mode::Float(_)) {
+        if matches!(
+            self.mode,
+            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Float(_) | Mode::Wall { .. } | Mode::Jump { .. }
+        ) {
             return false;
         }
         // From where he is seen: up on a leap or a head.
@@ -592,7 +648,13 @@ impl Actor {
     /// Whether a reaction from `trigger` may start now.
     pub fn can_react(&self, trigger: Trigger) -> bool {
         match self.mode {
-            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Leap { .. } | Mode::Perch { .. } | Mode::Float(_) => false,
+            Mode::Fall { .. }
+            | Mode::Drag { .. }
+            | Mode::Leap { .. }
+            | Mode::Perch { .. }
+            | Mode::Float(_)
+            | Mode::Wall { .. }
+            | Mode::Jump { .. } => false,
             _ if trigger == Trigger::User => true,
             Mode::Walk => self.rest <= 0.0,
             Mode::Act { kind, .. } => self.rest <= 0.0 && !matches!(kind, ActKind::Reaction { .. }),
@@ -660,10 +722,31 @@ impl Actor {
             Mode::Perch { .. } => "perch".into(),
             Mode::Float(Float { passenger: true, .. }) => "float along".into(),
             Mode::Float(_) => "float".into(),
+            Mode::Jump { .. } => "hop up".into(),
+            Mode::Wall { side, .. } => if side < 0.0 {
+                "climb left edge"
+            } else {
+                "climb right edge"
+            }
+            .into(),
         }
     }
 
     pub fn pose(&self) -> Pose {
+        if let Mode::Wall { side, to_y, .. } = self.mode {
+            // Forward is up the wall on the right edge unmirrored, and on the
+            // left edge mirrored.
+            let up = to_y <= self.y;
+            return Pose {
+                sprite: SpriteRef::Sheet(self.walk),
+                frame: self.walk_frame,
+                mirrored: (side > 0.0) != up,
+                x: self.x.round() as i32,
+                y: self.y.round() as i32,
+                mark: false,
+                rot: if side < 0.0 { Rot::Left } else { Rot::Right },
+            };
+        }
         let mirrored = self.dir < 0.0;
         let lift = (self.lift() * self.scale as f32).round() as i32;
         let (mut dx, mut mark) = (0, false);
@@ -685,6 +768,7 @@ impl Actor {
                 (SpriteRef::Sheet(self.walk), 0, 0)
             }
             Mode::Leap { .. } | Mode::Perch { .. } => (SpriteRef::Sheet(self.walk), 0, -lift),
+            Mode::Jump { .. } | Mode::Wall { .. } => (SpriteRef::Sheet(self.walk), 0, 0),
             Mode::Float(f) => {
                 let dy = -self.bob(&f).round() as i32;
                 if f.passenger {
@@ -702,6 +786,7 @@ impl Actor {
             x: self.x.round() as i32 + dx,
             y: self.y.round() as i32 + dy,
             mark,
+            rot: Rot::Upright,
         }
     }
 
@@ -754,6 +839,14 @@ impl Actor {
         }
         if let Mode::Float(f) = self.mode {
             self.float_step(f, rng);
+            return;
+        }
+        if let Mode::Jump { from_y, to_y, step } = self.mode {
+            self.jump_step(world, from_y, to_y, step, xi);
+            return;
+        }
+        if let Mode::Wall { side, to_y, back_to } = self.mode {
+            self.wall_step(side, to_y, back_to);
             return;
         }
 
@@ -907,7 +1000,9 @@ impl Actor {
                     self.mode = Mode::Perch { left: left - 1 };
                 }
             }
-            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Float(_) => unreachable!(),
+            Mode::Fall { .. } | Mode::Drag { .. } | Mode::Float(_) | Mode::Jump { .. } | Mode::Wall { .. } => {
+                unreachable!()
+            }
         }
     }
 
@@ -1101,7 +1196,21 @@ impl Actor {
             return;
         }
 
-        // Frames before cruise stand up and set off; then the cruise loop.
+        self.next_walk_frame();
+        if self.walk_frame >= sheet.launch {
+            let at_end = !self.advance(s, sheet.speed);
+            if at_end && world.climb && self.try_wall(world, s, rng) {
+                return;
+            }
+            if world.roam {
+                self.roam_roll(world, s, rng);
+            }
+        }
+    }
+
+    /// Frames before cruise stand up and set off; then the cruise loop.
+    fn next_walk_frame(&mut self) {
+        let sheet = &SHEETS[self.walk];
         let cruise_start = sheet.cruise.first().copied().unwrap_or(sheet.launch);
         if self.walk_frame + 1 < cruise_start {
             self.walk_frame += 1;
@@ -1113,9 +1222,132 @@ impl Actor {
                 .map_or(0, |k| (k + 1) % sheet.cruise.len());
             self.walk_frame = sheet.cruise[k];
         }
-        if self.walk_frame >= sheet.launch {
-            self.advance(s, sheet.speed);
+    }
+
+    /// Free roam, now and then while walking: stay, hop up onto the surface
+    /// above, or drop to the one below, weighed like the phone's lanes so
+    /// he spreads over the screen instead of settling on the ground.
+    fn roam_roll(&mut self, world: &World, s: &Surface, rng: &mut Rng) {
+        self.lane_in -= DT;
+        if self.lane_in > 0.0 {
+            return;
         }
+        self.lane_in = rng.range(LANE_GAP.0, LANE_GAP.1);
+        let xi = self.x.round() as i32;
+        let h = SHEETS[self.walk].h as f32 * self.scale as f32;
+        let reach = (LANE_SPACING * HOP_REACH * h).round() as i32;
+        let up = hop_target(world.surfaces, xi, s.y, reach);
+        // 0 under the highest surface over him, 1 on the ground.
+        let over = world.surfaces.iter().filter(|o| o.contains_x(xi));
+        let top = over.clone().map(|o| o.y).min().unwrap_or(s.y);
+        let bottom = over.filter(|o| o.ground).map(|o| o.y).max().unwrap_or(s.y);
+        let depth = if bottom > top {
+            (s.y - top) as f32 / (bottom - top) as f32
+        } else {
+            1.0
+        };
+        let anchor = s.owner_at(xi) != LANE;
+        let stay = ROAM_STAY * if anchor { ANCHOR_STAY } else { 1.0 };
+        let hop = if up.is_some() { 1.0 + UP_BIAS * depth } else { 0.0 };
+        let drop = if s.ground { 0.0 } else { 1.0 + DROP_BIAS * (1.0 - depth) };
+        match (pick_weighted(&[stay, hop, drop], rng), up) {
+            (1, Some(t)) => {
+                self.mode = Mode::Jump {
+                    from_y: self.y,
+                    to_y: world.surfaces[t].y as f32,
+                    step: 0,
+                };
+            }
+            (2, _) => {
+                self.owner = GROUND;
+                self.start_fall();
+            }
+            _ => {}
+        }
+    }
+
+    fn jump_step(&mut self, world: &World, from_y: f32, to_y: f32, step: usize, xi: i32) {
+        let step = step + 1;
+        let t = step as f32 / JUMP_STEPS as f32;
+        if step < JUMP_STEPS {
+            let peak = JUMP_PEAK * self.scale as f32;
+            self.y = from_y + (to_y - from_y) * t - peak * 4.0 * t * (1.0 - t);
+            self.mode = Mode::Jump { from_y, to_y, step };
+            return;
+        }
+        self.y = to_y;
+        match support(world.surfaces, xi, to_y.round() as i32, GROUND) {
+            Some((_, owner)) => {
+                self.owner = owner;
+                self.mode = Mode::Hop { step: 0, twice: false };
+            }
+            // The window he hopped for went away: down again.
+            None => self.start_fall(),
+        }
+    }
+
+    /// He just walked into the end of `s` (and turned): if that end is a
+    /// screen edge, now and then he climbs it instead, to another floor
+    /// that touches the edge, or partway up and back when there is none.
+    fn try_wall(&mut self, world: &World, s: &Surface, rng: &mut Rng) -> bool {
+        let side = -self.dir;
+        let Some(a) = area_at(world.areas, self.x.round() as i32, s.y) else {
+            return false;
+        };
+        let (edge, end, probe) = if side > 0.0 {
+            (a.right, s.x1, a.right - 1)
+        } else {
+            (a.left, s.x0, a.left)
+        };
+        if (end - edge).abs() > 2 || rng.f32() >= CLIMB_CHANCE {
+            return false;
+        }
+        let half = WALL_HALF * self.scale as f32;
+        let top = a.top as f32 + half;
+        let start = s.y as f32 - half;
+        let floors: Vec<f32> = world
+            .surfaces
+            .iter()
+            .filter(|o| o.y != s.y && o.y <= a.bottom && o.contains_x(probe))
+            .map(|o| o.y as f32 - half)
+            .filter(|&c| c >= top)
+            .collect();
+        let (to_y, back_to) = if floors.is_empty() {
+            (start - rng.range(0.3, 0.7) * (start - top).max(0.0), Some(start))
+        } else {
+            (floors[(rng.next_u64() % floors.len() as u64) as usize], None)
+        };
+        self.x = edge as f32;
+        self.y = start;
+        self.owner = GROUND;
+        self.mode = Mode::Wall { side, to_y, back_to };
+        true
+    }
+
+    fn wall_step(&mut self, side: f32, to_y: f32, back_to: Option<f32>) {
+        self.next_walk_frame();
+        let scale = self.scale as f32;
+        let v = SHEETS[self.walk].speed * self.speed_mul * scale * DT;
+        let d = to_y - self.y;
+        if d.abs() > v {
+            self.y += v * d.signum();
+            return;
+        }
+        self.y = to_y;
+        if let Some(b) = back_to {
+            self.mode = Mode::Wall {
+                side,
+                to_y: b,
+                back_to: None,
+            };
+            return;
+        }
+        // Off the wall: upright on the floor his body touches, walking away
+        // from the edge. If that floor went away meanwhile, he falls.
+        self.y = (to_y + WALL_HALF * scale).round();
+        self.x -= side * HALF_BODY * scale;
+        self.dir = -side;
+        self.resume_walk();
     }
 
     /// Moves along `s`, turning around at its ends. Returns false at an end.
@@ -1255,6 +1487,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let mut gaps = Vec::new();
         let mut chained = 0;
@@ -1304,6 +1539,9 @@ mod tests {
             surfaces: s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         a.next_act_in = 1000.0;
         for _ in 0..12 {
@@ -1320,6 +1558,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let mut rng = Rng::new(2);
         let mut a = walker(&mut rng, &s);
@@ -1409,6 +1650,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let mut rng = Rng::new(8);
         let mut a = walker(&mut rng, &s);
@@ -1462,6 +1706,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         a.set_feel(Feel::Annoyed);
         a.next_act_in = 1000.0;
@@ -1482,6 +1729,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let mut rng = Rng::new(6);
         let mut a = walker(&mut rng, &s);
@@ -1504,6 +1754,115 @@ mod tests {
         }
     }
 
+    fn roam_world<'a>(s: &'a [Surface], areas: &'a [Rect], roam: bool, climb: bool) -> World<'a> {
+        World {
+            surfaces: s,
+            idle_secs: 0.0,
+            leans: &[],
+            areas,
+            roam,
+            climb,
+        }
+    }
+
+    #[test]
+    fn in_free_roam_he_spreads_over_the_lanes() {
+        let spacing = (LANE_SPACING * 18.0 * 4.0) as i32;
+        let s = crate::surfaces::build_with(&[], &[mon()], 72, Some(spacing));
+        let areas = [mon().work];
+        let world = roam_world(&s, &areas, true, false);
+        let mut rng = Rng::new(11);
+        let mut a = Actor::new(900, 1032, 4, &mut rng);
+        let mut feet = std::collections::BTreeMap::new();
+        for _ in 0..FPS as usize * 60 * 20 {
+            a.next_act_in = 1000.0;
+            a.step(&world, &mut rng);
+            if a.is_walking() {
+                *feet.entry(a.y.round() as i32).or_insert(0usize) += 1;
+            }
+        }
+        let lanes = s.len();
+        assert!(
+            feet.len() >= lanes - 1,
+            "visited {} of {lanes} floors: {feet:?}",
+            feet.len()
+        );
+        let total: usize = feet.values().sum();
+        let ground = feet.get(&1032).copied().unwrap_or(0);
+        assert!(ground * 2 < total, "mostly off the ground: {ground} of {total}");
+        assert!(feet.keys().all(|y| s.iter().any(|f| f.y == *y)), "always on a floor");
+    }
+
+    #[test]
+    fn roam_off_he_stays_on_the_ground() {
+        let s = build(&[], &[mon()], 72);
+        let areas = [mon().work];
+        let world = roam_world(&s, &areas, false, false);
+        let mut rng = Rng::new(12);
+        let mut a = walker(&mut rng, &s);
+        for _ in 0..FPS as usize * 120 {
+            a.next_act_in = 1000.0;
+            a.step(&world, &mut rng);
+            assert!(!a.is_climbing());
+        }
+        assert_eq!(a.y, 1032.0);
+    }
+
+    #[test]
+    fn he_climbs_a_screen_edge_onto_a_lane_and_walks_off_it() {
+        let spacing = (LANE_SPACING * 18.0 * 4.0) as i32;
+        let s = crate::surfaces::build_with(&[], &[mon()], 72, Some(spacing));
+        let areas = [mon().work];
+        let world = roam_world(&s, &areas, false, true);
+        let mut rng = Rng::new(13);
+        let mut a = walker(&mut rng, &s);
+        a.dir = 1.0;
+        let mut climbs = 0;
+        let mut was = false;
+        for _ in 0..FPS as usize * 600 {
+            a.next_act_in = 1000.0;
+            a.step(&world, &mut rng);
+            let on_wall = matches!(a.mode, Mode::Wall { .. });
+            if on_wall {
+                let p = a.pose();
+                assert!(p.rot != Rot::Upright);
+                assert!(p.x == 0 || p.x == 1920, "against an edge: {}", p.x);
+                assert!(p.y >= 0 && p.y <= 1032);
+            }
+            if was && !on_wall {
+                climbs += 1;
+                // Stepped off upright onto a floor, facing away from the edge.
+                assert!(a.is_walking());
+                assert!(s.iter().any(|f| f.y == a.y as i32), "feet on a floor at {}", a.y);
+                assert!(a.x > 0.0 && a.x < 1920.0);
+            }
+            was = on_wall;
+        }
+        assert!(climbs >= 3, "climbed {climbs} times");
+    }
+
+    #[test]
+    fn with_no_floor_up_the_edge_he_peeks_and_comes_back_down() {
+        let s = build(&[], &[mon()], 72);
+        let areas = [mon().work];
+        let world = roam_world(&s, &areas, false, true);
+        let mut rng = Rng::new(14);
+        let mut a = walker(&mut rng, &s);
+        let mut highest = 1032.0f32;
+        let mut climbed = false;
+        for _ in 0..FPS as usize * 300 {
+            a.next_act_in = 1000.0;
+            a.step(&world, &mut rng);
+            if matches!(a.mode, Mode::Wall { .. }) {
+                climbed = true;
+                highest = highest.min(a.y);
+            }
+        }
+        assert!(climbed);
+        assert!(highest < 900.0, "went well up: {highest}");
+        assert_eq!(a.y, 1032.0, "and back on the ground");
+    }
+
     #[test]
     fn falls_onto_window_then_ground_when_it_closes() {
         let mut rng = Rng::new(3);
@@ -1517,6 +1876,9 @@ mod tests {
             surfaces: &with,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         for _ in 0..60 {
             a.step(&world, &mut rng);
@@ -1529,6 +1891,9 @@ mod tests {
             surfaces: &without,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         a.step(&world, &mut rng);
         assert!(a.is_falling());
@@ -1551,6 +1916,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let (mut min, mut max) = (i32::MAX, i32::MIN);
         for _ in 0..12 * 15 {
@@ -1574,6 +1942,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         for _ in 0..10 {
             a.step(&world, &mut rng);
@@ -1582,6 +1953,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 200.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         a.step(&idle, &mut rng);
         let d = a.describe();
@@ -1626,6 +2000,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let area = mon().work;
         let cap = FLOAT_CAP * 4.0 / FPS as f32 + 0.01;
@@ -1714,6 +2091,9 @@ mod tests {
             surfaces: &s,
             idle_secs: 0.0,
             leans: &[],
+            areas: &[],
+            roam: false,
+            climb: false,
         };
         let mut rng = Rng::new(31);
         let mut a = walker(&mut rng, &s);

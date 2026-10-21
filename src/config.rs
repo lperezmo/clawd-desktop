@@ -21,6 +21,10 @@ pub struct Config {
     pub follow_claude: bool,
     /// Clawds that meet chat, shove, ride each other and work side by side.
     pub crowd_antics: bool,
+    /// Invisible lanes up the screen, hopped between, like the phone.
+    pub free_roam: bool,
+    /// He climbs the left and right screen edges.
+    pub climb_walls: bool,
 }
 
 impl Default for Config {
@@ -33,6 +37,8 @@ impl Default for Config {
             clickable: true,
             follow_claude: true,
             crowd_antics: true,
+            free_roam: false,
+            climb_walls: false,
         }
     }
 }
@@ -95,6 +101,8 @@ mod tests {
             clickable: false,
             follow_claude: false,
             crowd_antics: false,
+            free_roam: true,
+            climb_walls: true,
         };
         let s = toml::to_string(&c).unwrap();
         assert_eq!(toml::from_str::<Config>(&s).unwrap(), c);
@@ -110,6 +118,10 @@ mod tests {
         assert!(partial.clickable, "clickable by default");
         assert!(partial.follow_claude, "follows Claude Code by default");
         assert!(partial.crowd_antics, "crowd antics on by default");
+        assert!(
+            !partial.free_roam && !partial.climb_walls,
+            "roam and climb off by default"
+        );
         let three: Config = toml::from_str(
             "count = 3
 paused = true",
