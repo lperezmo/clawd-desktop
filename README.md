@@ -2,12 +2,14 @@
 
 Clawd, the pixel crab from claude.dev, walks along the top edges of your windows and the taskbar on Windows. He lives in transparent, topmost overlay windows that never take focus and do not show up in Alt-Tab; only his own pixels take the mouse, and only while Clickable is on. Up to five of him can walk at once.
 
-<p align="center"><img src="assets/clawd-256.png" width="128" alt="Clawd"></p>
+<p align="center"><img src="assets/demo.gif" width="800" alt="Five Clawds roaming the desktop, hopping between lanes and climbing the screen edges"></p>
 
 ## What it looks like
 
 - **Surfaces**: he walks on the visible top edge of every window and on the taskbar, turns at the ends, and rides along when you drag the window he is standing on.
 - **Falling**: when that window closes, minimizes or moves out from under him, he falls to the next edge below.
+- **Free roam** (tray toggle): invisible lanes run up the screen, like the phone version, and every few seconds he may hop up onto the lane or window top above him or drop to the one below, so a crowd spreads over the whole screen.
+- **Climbing walls** (tray toggle): walking into the left or right screen edge, he often turns sideways and climbs it to another lane or window top that touches the edge, or partway up and back down when there is none.
 - **Zero g**: now and then (about once every 20 to 30 minutes per Clawd) he plays the space act, gravity turns off for him and he floats around until it ends.
 - **Company**: with more than one Clawd, each keeps his own pace and timers, and two walking into each other never pass through. When two meet head on they stop and face each other for a beat before one turns, as if chatting; now and then one climbs on the other and rides him for a moment (never three high), and rarely the one who was walking longer shoves, so the other hops over him and lands behind with a startled "?!". While Claude Code is locked in, or when one walks up to another at his laptop, they sit down with their laptops back to back or facing each other. A chat or a ride leaves him happy, a shove annoyed, and that leans his next act. None of it lasts more than about three seconds, apart from the laptops, which are ordinary laptop acts.
 
@@ -46,6 +48,8 @@ That copies it to `%LOCALAPPDATA%\Programs\clawd-desktop\clawd-desktop.exe` and 
 - Clickable (on by default): off, the mouse goes straight through him as before.
 - Follow Claude Code (on by default): reads `%LOCALAPPDATA%\clawd\sessions`, which clawd-buddy writes; nothing happens if it does not exist.
 - Crowd antics (on by default, `crowd_antics` in config.toml): off, Clawds that meet only turn apart.
+- Free roam (off by default, `free_roam`): lanes up the screen to hop between.
+- Climb walls (off by default, `climb_walls`): he climbs the screen edges.
 - Hide while fullscreen (on by default)
 - Start with Windows
 - Quit
